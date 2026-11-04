@@ -1,0 +1,77 @@
+/* NoteCraft page: the same look when reading and when editing. */
+html, body { margin: 0; padding: 0; background: #fff; }
+body {
+  font-family: 'Segoe UI', 'Segoe UI Variable Text', Calibri, Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  color: #252423;
+}
+::selection { background: #d9c6ee; }
+
+#page {
+  padding: 2px 18px 60px 2px;
+  min-height: calc(100vh - 70px);
+  outline: none;
+  word-wrap: break-word;
+  caret-color: #6b2fa0;
+}
+#page[contenteditable="true"] { padding-top: 10px; }
+
+#page > :first-child { margin-top: 0; }
+p { margin: 0 0 10px 0; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin: 18px 0 8px 0; color: #1f1d1b; }
+h1 { font-size: 26px; }
+h2 { font-size: 21px; }
+h3 { font-size: 18px; }
+h4, h5, h6 { font-size: 15px; }
+strong, b { font-weight: 700; }
+a { color: #6b2fa0; text-decoration: underline; text-underline-offset: 2px; }
+#page:not([contenteditable="true"]) a { cursor: pointer; }
+#page[contenteditable="true"] a { cursor: text; }
+ul, ol { margin: 0 0 10px 0; padding-left: 26px; }
+li { margin: 2px 0; }
+li > p { margin: 0; }
+li > input[type="checkbox"]:first-child { margin: 0 6px 0 -2px; vertical-align: -2px; }
+ul:has(> li > input[type="checkbox"]:first-child) { list-style: none; padding-left: 8px; }
+li:has(> input[type="checkbox"]:checked:first-child) { color: #7a7774; text-decoration: line-through; text-decoration-color: #b8b4b0; }
+input[type="checkbox"] { accent-color: #6b2fa0; width: 15px; height: 15px; cursor: pointer; }
+blockquote { margin: 0 0 10px 0; padding: 2px 0 2px 14px; border-left: 3px solid #d0c3e0; color: #5d5a57; }
+code { font-family: Consolas, 'Cascadia Mono', monospace; font-size: 13.5px; background: #f3f1ef; padding: 1px 4px; border-radius: 3px; }
+pre { font-family: Consolas, 'Cascadia Mono', monospace; font-size: 13.5px; background: #f6f5f3; border: 1px solid #e8e6e3; padding: 8px 10px; border-radius: 4px; white-space: pre-wrap; margin: 0 0 10px 0; }
+pre code { background: none; padding: 0; }
+hr { border: none; border-top: 1px solid #d6d3d0; margin: 14px 0; }
+img { max-width: 100%; height: auto; }
+table { border-collapse: collapse; margin: 4px 0 12px 0; }
+th, td { border: 1px solid #c9c5c1; padding: 4px 9px; vertical-align: top; text-align: left; min-width: 40px; }
+th { background: #f4f0f8; font-weight: 600; }
+td > p:last-child, th > p:last-child { margin-bottom: 0; }
+#page[contenteditable="true"] td:focus-within, #page[contenteditable="true"] th:focus-within { outline: 2px solid #b79ad6; outline-offset: -2px; }
+mark { background: #ffe680; color: inherit; padding: 0; border-radius: 2px; }
+mark.current { background: #ffbf3f; }
+
+/* Formatting toolbar, shown while editing. */
+#toolbar {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+  background: #faf9f8; border: 1px solid #e1dfdd; border-radius: 6px;
+  padding: 5px 6px; margin: 0 14px 4px 0;
+  font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px;
+  user-select: none;
+}
+#toolbar[hidden] { display: none; }
+#toolbar button, #toolbar select {
+  font: inherit; color: #252423; background: #fff;
+  border: 1px solid #d6d3d0; border-radius: 4px;
+  height: 28px; min-width: 30px; padding: 0 8px; cursor: pointer;
+}
+#toolbar select { padding: 0 4px; }
+#toolbar button:hover, #toolbar select:hover { background: #f4eff9; border-color: #b79ad6; }
+#toolbar button.on { background: #ece2f6; border-color: #6b2fa0; }
+#toolbar button:disabled { color: #bbb; background: #fff; border-color: #e6e4e1; cursor: default; }
+#toolbar .sep { width: 1px; height: 20px; background: #dcd9d6; margin: 0 3px; }
+#toolbar .b { font-weight: 700; }
+#toolbar .i { font-style: italic; font-family: Georgia, serif; }
+#toolbar .s { text-decoration: line-through; }
+#toolbar .mono { font-family: Consolas, monospace; }
+#toolbar .group { display: inline-flex; gap: 4px; align-items: center; }
+#toolbar .group[hidden] { display: none; }

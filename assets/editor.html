@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http: https:; connect-src 'none'; object-src 'none'; frame-src 'none'">
+<link rel="stylesheet" href="http://notecraft.localhost/editor.css">
+<base id="base" href="http://notecraft.localhost/">
+<title>NoteCraft page</title>
+</head>
+<body>
+<div id="toolbar" hidden>
+  <select id="block" title="Paragraph style">
+    <option value="p">Normal text</option>
+    <option value="h1">Heading 1</option>
+    <option value="h2">Heading 2</option>
+    <option value="h3">Heading 3</option>
+    <option value="blockquote">Quote</option>
+    <option value="pre">Code block</option>
+  </select>
+  <span class="sep"></span>
+  <button data-cmd="bold" class="b" title="Bold (Ctrl+B)">B</button>
+  <button data-cmd="italic" class="i" title="Italic (Ctrl+I)">I</button>
+  <button data-cmd="strikeThrough" class="s" title="Strikethrough">S</button>
+  <button data-cmd="code" class="mono" title="Code">&lt;/&gt;</button>
+  <button data-cmd="link" title="Link (Ctrl+K)">🔗 Link</button>
+  <span class="sep"></span>
+  <button data-cmd="insertUnorderedList" title="Bulleted list">• List</button>
+  <button data-cmd="insertOrderedList" title="Numbered list">1. List</button>
+  <button data-cmd="task" title="To-do checkbox">☑ To-do</button>
+  <button data-cmd="outdent" title="Move left (Shift+Tab)">⇤</button>
+  <button data-cmd="indent" title="Move right (Tab)">⇥</button>
+  <span class="sep"></span>
+  <button data-cmd="table" title="Insert a table">▦ Table</button>
+  <span class="group" id="tablegroup" hidden>
+    <button data-cmd="rowAbove" title="Add a row above">+ Row ↑</button>
+    <button data-cmd="rowBelow" title="Add a row below (Tab in the last cell does this too)">+ Row ↓</button>
+    <button data-cmd="colLeft" title="Add a column on the left">+ Col ←</button>
+    <button data-cmd="colRight" title="Add a column on the right">+ Col →</button>
+    <button data-cmd="delRow" title="Delete this row">− Row</button>
+    <button data-cmd="delCol" title="Delete this column">− Col</button>
+    <button data-cmd="delTable" title="Delete the whole table">✕ Table</button>
+  </span>
+  <span class="sep"></span>
+  <button data-cmd="insertHorizontalRule" title="Dividing line">― Line</button>
+  <button data-cmd="undo" title="Undo (Ctrl+Z)">↶</button>
+  <button data-cmd="redo" title="Redo (Ctrl+Y)">↷</button>
+</div>
+<div id="page" spellcheck="true"></div>
+<script src="http://notecraft.localhost/editor.js"></script>
+</body>
+</html>

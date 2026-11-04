@@ -1,0 +1,43 @@
+﻿How to use NoteCraft on another computer
+=========================================
+
+NoteCraft is one file: NoteCraft.exe. There is nothing to install.
+It runs on any 64-bit Windows 10 or Windows 11 computer.
+Pages are shown with Microsoft Edge WebView2, which Windows 10 and 11
+already include. On a very old Windows 10 without it, NoteCraft still
+works with a simpler page view; installing "WebView2 Runtime" from
+Microsoft brings the full view back.
+
+1. Copy NoteCraft.exe to the other computer
+   - with a USB stick, by e-mail, or through the shared folder;
+   - put it somewhere handy, for example in Documents.
+   Tip: you can also keep NoteCraft.exe in the shared notes folder itself
+   and start it from there on every computer.
+
+2. Start it
+   - double-click NoteCraft.exe;
+   - if Windows shows "Windows protected your PC", click "More info" and
+     then "Run anyway" (NoteCraft is not signed by a publisher, so
+     Windows asks once).
+
+3. Choose your notes folder
+   - the first time, NoteCraft asks for the folder with your notes;
+   - choose the shared folder (through "Network" or its drive letter);
+   - each computer remembers its own choice; to change it, click the
+     folder name at the top left of the window.
+
+4. Make it easy to find (optional)
+   - right-click NoteCraft.exe, choose "Show more options",
+     "Send to", "Desktop (create shortcut)";
+   - or start it, right-click its icon in the taskbar and choose
+     "Pin to taskbar".
+
+Working together
+   Several computers can have the same notes open. Only one of them can
+   edit a page at a time; the others see who is editing it and get the
+   new text as soon as it is saved. If a computer crashes while editing,
+   the page is free again after about three minutes.
+
+New version
+   Replace NoteCraft.exe with the new file on each computer (close
+   NoteCraft first). Your notes and settings stay as they are.
