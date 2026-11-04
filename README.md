@@ -144,3 +144,7 @@ NoteCraft folders. See its [README](tools/onenote-import/README.md).
 | `src\web.rs`         | The WebView2 page view                                       |
 | `assets\editor.*`    | The page view's HTML, CSS and JavaScript                     |
 | `docs\superpowers`   | Design notes and implementation plans                        |
+
+## License
+
+MIT, see [LICENSE](LICENSE).
