@@ -4,9 +4,25 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
-/// `](resources/x)`, `src="resources/x"`, `src='resources/x'` and `<resources/x>`.
-static LINK: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(\]\(|src="|src='|<)resources/([^)"'>\s]+)"#).expect("mover: link pattern"));
+/// Picture links: `](<resources/a b.png>)` and `<resources/a b.png>` (the editor writes names with
+/// spaces or parentheses this way; the name runs to `>`), and `](resources/x)`, `src="resources/x"`,
+/// `src='resources/x'`. Groups: 1+2 = angle form (prefix, name), 3+4 = plain form (prefix, name).
+static LINK: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(\]\(<|<)resources/([^>\r\n]+)>|(\]\(|src="|src=')resources/([^)"'>\s]+)"#).expect("mover: link pattern")
+});
+
+/// The prefix, the name as written and whether it is the angle form, of one link match.
+fn link_parts<'a>(c: &regex::Captures<'a>) -> (&'a str, &'a str, bool) {
+    match (c.get(1), c.get(2)) {
+        (Some(p), Some(n)) => (p.as_str(), n.as_str(), true),
+        _ => (c.get(3).map_or("", |m| m.as_str()), c.get(4).map_or("", |m| m.as_str()), false),
+    }
+}
+
+/// Picture names compare without case, like the file system.
+fn same_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
 
 /// Decodes `%XX` sequences (UTF-8); anything else is kept as is.
 fn decode(s: &str) -> String {
@@ -29,8 +45,8 @@ fn decode(s: &str) -> String {
 pub(crate) fn picture_links(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for c in LINK.captures_iter(text) {
-        let name = decode(&c[2]);
-        if !out.contains(&name) {
+        let name = decode(link_parts(&c).1);
+        if !out.iter().any(|o| same_name(o, &name)) {
             out.push(name);
         }
     }
@@ -55,7 +71,16 @@ pub(crate) fn encode_name(name: &str) -> String {
 /// Points every link to the picture `old` at `new` instead.
 pub(crate) fn rewrite_picture_link(text: &str, old: &str, new: &str) -> String {
     LINK.replace_all(text, |c: &regex::Captures| {
-        if decode(&c[2]) == old { format!("{}resources/{}", &c[1], encode_name(new)) } else { c[0].to_string() }
+        let (prefix, name, angle) = link_parts(c);
+        if !same_name(&decode(name), old) {
+            c[0].to_string()
+        } else if angle && !name.contains('%') {
+            format!("{prefix}resources/{}>", new.replace('<', "%3C").replace('>', "%3E"))
+        } else if angle {
+            format!("{prefix}resources/{}>", encode_name(new))
+        } else {
+            format!("{prefix}resources/{}", encode_name(new))
+        }
     })
     .into_owned()
 }
@@ -98,8 +123,14 @@ fn copy_then_remove(from: &Path, to: &Path) -> std::io::Result<()> {
         }
         Ok(())
     }
-    copy_tree(from, to)?;
-    if from.is_dir() { fs::remove_dir_all(from) } else { fs::remove_file(from) }
+    if let Err(e) = copy_tree(from, to) {
+        // Leave nothing half-copied behind.
+        let _ = if to.is_dir() { fs::remove_dir_all(to) } else { fs::remove_file(to) };
+        return Err(e);
+    }
+    // The copy is complete: the move counts as done even when some originals cannot be removed.
+    let _ = if from.is_dir() { fs::remove_dir_all(from) } else { fs::remove_file(from) };
+    Ok(())
 }
 
 /// All files below `dir` (none when it does not exist).
@@ -254,7 +285,7 @@ pub fn move_page(page: &Path, target_dir: &Path) -> Result<Option<PathBuf>, Stri
     // 4. Remove originals nothing else needs.
     if let Some(linked) = names_still_linked(src_dir) {
         for n in copied {
-            if !linked.contains(&n) {
+            if !linked.iter().any(|l| same_name(l, &n)) {
                 let _ = fs::remove_file(src_res.join(&n));
             }
         }
@@ -295,6 +326,19 @@ mod tests {
     fn links_decode_percent() {
         assert_eq!(picture_links("![](resources/Plan%202026-11-16%20103000.png)"), vec!["Plan 2026-11-16 103000.png"]);
         assert_eq!(picture_links("![](resources/%C4%8Crka.png)"), vec!["Črka.png"]);
+    }
+
+    #[test]
+    fn links_angle_form_from_editor() {
+        // What editor.js `mdUrl` writes for names with spaces or parentheses.
+        let t = "![](<resources/Plan 2026-11-16 103000.png>) [f](<resources/P (2).pdf>) ![](resources/c.png)";
+        assert_eq!(picture_links(t), vec!["Plan 2026-11-16 103000.png", "P (2).pdf", "c.png"]);
+    }
+
+    #[test]
+    fn rewrite_keeps_angle_form() {
+        let t = "![](<resources/a b.png>) ![](resources/a%20b.png)";
+        assert_eq!(rewrite_picture_link(t, "a b.png", "a b-2.png"), "![](<resources/a b-2.png>) ![](resources/a%20b-2.png)");
     }
 
     #[test]
@@ -527,6 +571,84 @@ mod tests {
         let orig = pic(&a, "P 2026.png", b"X");
         move_page(&p, &b).unwrap();
         assert!(!orig.exists() && b.join("resources").join("P 2026.png").is_file());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn move_editor_picture_with_spaces() {
+        let (d, a, b) = notebook("pic-angle");
+        let p = page_with(&a, "P", "![](<resources/P 2026 (2).png>)");
+        let orig = pic(&a, "P 2026 (2).png", b"X");
+        let new = move_page(&p, &b).unwrap().unwrap();
+        assert!(!orig.exists() && b.join("resources").join("P 2026 (2).png").is_file());
+        assert!(fs::read_to_string(&new).unwrap().contains("](<resources/P 2026 (2).png>)"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn keeps_picture_linked_in_angle_form_by_sibling() {
+        let (d, a, b) = notebook("pic-angle-sibling");
+        let p = page_with(&a, "P", "![](resources/P%202026.png)");
+        page_with(&a, "Q", "![](<resources/P 2026.png>)");
+        let orig = pic(&a, "P 2026.png", b"X");
+        move_page(&p, &b).unwrap();
+        assert!(orig.exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn keeps_picture_linked_with_other_case() {
+        let (d, a, b) = notebook("pic-case");
+        let p = page_with(&a, "P", "![](resources/photo.png)");
+        page_with(&a, "Q", "![](resources/Photo.PNG)");
+        let orig = pic(&a, "photo.png", b"X");
+        move_page(&p, &b).unwrap();
+        assert!(orig.exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Opens a file so that nobody else may read or delete it until the handle is dropped.
+    #[cfg(windows)]
+    fn lock_hard(p: &Path) -> fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new().read(true).share_mode(0).open(p).unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_then_remove_keeps_copy_when_removal_fails() {
+        let d = temp("copy-remove-fails");
+        let from = d.join("from");
+        fs::create_dir_all(&from).unwrap();
+        fs::write(from.join("a.md"), "A").unwrap();
+        fs::write(from.join("b.md"), "B").unwrap();
+        let to = d.join("to");
+        // Readable but not deletable: open without delete sharing.
+        let guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new().read(true).share_mode(1).open(from.join("b.md")).unwrap()
+        };
+        assert!(copy_then_remove(&from, &to).is_ok());
+        drop(guard);
+        assert_eq!(fs::read_to_string(to.join("a.md")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(to.join("b.md")).unwrap(), "B");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_then_remove_cleans_partial_copy() {
+        let d = temp("copy-fails");
+        let from = d.join("from");
+        fs::create_dir_all(&from).unwrap();
+        fs::write(from.join("a.md"), "A").unwrap();
+        fs::write(from.join("b.md"), "B").unwrap();
+        let to = d.join("to");
+        let guard = lock_hard(&from.join("b.md"));
+        assert!(copy_then_remove(&from, &to).is_err());
+        drop(guard);
+        assert!(!to.exists());
+        assert!(from.join("a.md").is_file() && from.join("b.md").is_file());
         let _ = fs::remove_dir_all(&d);
     }
 

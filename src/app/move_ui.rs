@@ -86,6 +86,10 @@ impl NoteApp {
             .and_then(|p| p.path.strip_prefix(page.parent()?).ok().map(|r| r.to_path_buf()));
         if open_rel.is_some() {
             self.save_if_dirty();
+            // A failed save keeps the text only in the open page: do not drop it.
+            if self.page.as_ref().is_some_and(|p| p.body != p.saved_body) {
+                return Err("The open page could not be saved, so it was not moved. Save it first.".into());
+            }
             self.leave_edit();
             self.page = None;
         }
