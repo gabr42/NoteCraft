@@ -124,12 +124,71 @@ make-dist.cmd               :: release build copied to dist\NoteCraft.exe
 
 Command-line options meant for development and screenshots: `--page <file>`, `--edit`,
 `--search <text>`, `--history`, `--show-history`, `--show-deleted`, `--screenshot <png>`
-(use the release build for screenshots).
+(use the release build for screenshots), and `--import-onenote <notebook folder> <target folder>`
+(see [Importing from OneNote](#importing-from-onenote)).
 
 ## Importing from OneNote
 
-`tools\onenote-import` has a standalone Python 3 converter that turns OneNote `.one` files into
-NoteCraft folders. See its [README](tools/onenote-import/README.md).
+NoteCraft converts the `.one` files of a OneNote notebook into pages. You need the notebook as a
+folder of `.one` files; they are only read, never changed.
+
+Choose **Folders ▸ Import from OneNote…**. The window has three steps:
+
+1. **OneNote notebook.** Type or browse to the folder with the notebook's `.one` files (a full path). The window
+   shows how many sections it found, for example "Found 14 sections in 3 folders." Next is enabled
+   when there is at least one section. The `OneNote_RecycleBin` folder is skipped.
+2. **Target folder.** Type or browse to the folder to write into. The notebook is written to a
+   subfolder named like the source folder, and the window shows that path. The target must be a full
+   path (relative paths are refused) and must not be the source folder or inside it, and the source must not be inside the notebook's folder. If the
+   notebook's folder already holds anything, NoteCraft asks once before it goes on: pages that
+   already exist will be replaced, and their current text is kept in their history.
+3. **Import.** A progress bar shows the section being written. Cancel stops after the section being
+   written; what was written stays. At the end a summary lists the sections, the new, replaced and
+   unchanged pages, the number of pictures and attachments written and any problems.
+
+When the import is done the notebook folder (`<target>\<notebook>`) is added to the folders (or, if
+it cannot be added, the view is reloaded) and the imported notebook is selected.
+
+Every OneNote section becomes a folder of pages, and the folders of the source become folders around
+them. A section or folder whose name is already taken gets `-1`, `-2` ... added to its name. A name
+that starts with a dot gets `_` in front (`.NET` becomes `_.NET`), and a name NoteCraft hides
+(`resources`, `_resources`, `attachments`) gets the number, so that the folder is shown. Pages with
+the same title are numbered the same way, and a page called `resources` too; a page that starts
+with a dot keeps its name.
+Pictures and attachments are saved in a `resources` folder inside each section's folder.
+
+Importing the same notebook again is safe:
+
+- A page whose text did not change is not rewritten.
+- A page that changed is replaced, and its old text is first saved as a version (see
+  [History](#history)), whatever the age of the newest version.
+- A page that someone is editing on another computer, or whose old text cannot be saved to the
+  history, is skipped and listed under the problems.
+- Pages that no longer exist in OneNote are not deleted from the target.
+
+The same import can be run without a window:
+
+```
+NoteCraft.exe --import-onenote "E:\OneNote\Work" "D:\Notes"
+```
+
+It prints a line per section and then the summary. The exit code is 0 when every section was
+imported, 1 when a section failed or the target was refused, and 2 when a folder is missing from
+the command line.
+
+The import is a port of the Python converter in `tools\onenote-import`, which is kept as the
+reference implementation. The output is the same page for page, with these deliberate differences:
+
+- Times are converted to the computer's own time zone (Python uses a fixed Central European rule).
+- A page without a title is called `Untitled page` in the file name and in its title (Python writes
+  the title `Neimenovana stran`).
+- Leftover `<span>` tags are removed from every page.
+- Pictures and attachments go to a `resources` folder next to each section's pages, as for pasted
+  pictures (Python writes one `resources` folder for the whole notebook).
+- Underline, superscript and subscript are kept, as `<u>`, `<sup>` and `<sub>` (Python drops them).
+
+To compare the two importers, run both into empty scratch folders and run `compare.py` on the
+notebook folders; see the [tool's README](tools/onenote-import/README.md).
 
 ## Layout of the source
 
@@ -137,9 +196,11 @@ NoteCraft folders. See its [README](tools/onenote-import/README.md).
 |----------------------|--------------------------------------------------------------|
 | `src\app.rs`         | The window: columns, menus, search, dialogs                  |
 | `src\app\history_ui.rs` | History, deleted items and history-search windows          |
+| `src\app\import_ui.rs` | The Import from OneNote window                             |
 | `src\store.rs`       | Reading and writing folders and pages, the search index      |
 | `src\history.rs`     | Versions, deleted items, purge and history search            |
 | `src\lock.rs`        | Edit locks for shared folders                                |
+| `src\onenote\`       | OneNote import: `.one` parser, conversion, writing pages     |
 | `src\render.rs`      | Markdown to HTML for viewing, searching and printing         |
 | `src\web.rs`         | The WebView2 page view                                       |
 | `assets\editor.*`    | The page view's HTML, CSS and JavaScript                     |
