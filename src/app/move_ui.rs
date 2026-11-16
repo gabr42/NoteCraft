@@ -209,6 +209,8 @@ impl NoteApp {
             && let Ok(rest) = sel.strip_prefix(folder)
         {
             self.selected_folder = Some(new.join(rest));
+            // The selection follows the section, also into another notebook.
+            self.show_root_of(&new);
         }
         self.reload_tree();
         self.reload_pages();

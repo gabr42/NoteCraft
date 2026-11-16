@@ -958,7 +958,7 @@ impl NoteApp {
             // Which top folder is shown.
             let names: Vec<String> = self.roots.iter().map(|r| folder_name(r)).collect();
             let mut chosen = self.active;
-            egui::ComboBox::from_id_salt("top-folder")
+            let combo = egui::ComboBox::from_id_salt("top-folder")
                 .width(ui.available_width() - 8.0)
                 .selected_text(RichText::new(names.get(self.active).cloned().unwrap_or_default()).strong())
                 .show_ui(ui, |ui| {
@@ -966,6 +966,12 @@ impl NoteApp {
                         ui.selectable_value(&mut chosen, i, n.as_str()).on_hover_text(self.roots[i].display().to_string());
                     }
                 });
+            // The shown top folder takes dropped pages and sections (it has no row of its own in
+            // the tree when it holds only sections).
+            if let Some(root) = self.roots.get(self.active).cloned() {
+                self.page_drop_target(ui, &combo.response, &root);
+                self.section_drop_target(ui, &combo.response, &root);
+            }
             if chosen != self.active {
                 self.actions.push(Action::SelectRoot(chosen));
             }
