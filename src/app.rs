@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 mod history_ui;
 mod import_ui;
+mod move_ui;
 
 const ACCENT: Color32 = Color32::from_rgb(0x6B, 0x2F, 0xA0);
 const ACCENT_DARK: Color32 = Color32::from_rgb(0x55, 0x22, 0x82);
@@ -80,6 +81,10 @@ enum Action {
     NewSubpage(PathBuf),
     RenamePage(PathBuf),
     DeletePage(PathBuf),
+    /// Open the "Move to…" dialog for a page.
+    ShowMove(PathBuf),
+    /// Move a page into a folder (a section, or the subpage folder of another page).
+    MovePage { page: PathBuf, target_dir: PathBuf },
     NewSection(PathBuf),
     RenameSection(PathBuf),
     DeleteSection(PathBuf),
@@ -185,6 +190,8 @@ pub struct NoteApp {
     history_view: Option<history_ui::HistoryView>,
     /// The Import from OneNote wizard.
     import_win: Option<import_ui::ImportWin>,
+    /// The "Move to…" dialog.
+    move_win: Option<move_ui::MoveDialog>,
     /// The folders the wizard used last (remembered).
     import_src: Option<PathBuf>,
     import_dst: Option<PathBuf>,
@@ -256,6 +263,7 @@ impl NoteApp {
             history_search: history_ui::HistorySearch::default(),
             history_view: None,
             import_win: None,
+            move_win: None,
             import_src: settings.import_src.clone(),
             import_dst: settings.import_dst.clone(),
         };
@@ -653,6 +661,12 @@ impl NoteApp {
                 Action::RenamePage(p) => {
                     let title = store::read_doc(&p).map(|d| d.title_or(&p)).unwrap_or_default();
                     self.show_dialog(Dialog::RenamePage { path: p, title })
+                }
+                Action::ShowMove(p) => self.open_move(p),
+                Action::MovePage { page, target_dir } => {
+                    if let Err(e) = self.do_move(&page, &target_dir) {
+                        self.show_message("Move page", e);
+                    }
                 }
                 Action::DeletePage(p) => {
                     let title = store::read_doc(&p).map(|d| d.title_or(&p)).unwrap_or_default();
@@ -1115,6 +1129,10 @@ impl NoteApp {
                 self.actions.push(Action::NewSubpage(path.clone()));
                 ui.close();
             }
+            if ui.button("Move to…").clicked() {
+                self.actions.push(Action::ShowMove(path.clone()));
+                ui.close();
+            }
             if ui.button("Print").clicked() {
                 self.actions.push(Action::PrintPage(path.clone()));
                 ui.close();
@@ -1210,6 +1228,9 @@ impl NoteApp {
                         }
                         if ui.button("New subpage…").clicked() {
                             self.actions.push(Action::NewSubpage(path.clone()));
+                        }
+                        if ui.button("Move to…").clicked() {
+                            self.actions.push(Action::ShowMove(path.clone()));
                         }
                         if ui.button("History…").on_hover_text("Earlier versions of this page").clicked() {
                             self.actions.push(Action::ShowHistory(path.clone()));
@@ -1610,7 +1631,7 @@ impl NoteApp {
                 i.key_pressed(Key::Escape),
             )
         });
-        if self.dialog.is_some() || self.import_win.is_some() {
+        if self.dialog.is_some() || self.import_win.is_some() || self.move_win.is_some() {
             return;
         }
         if find {
@@ -1807,6 +1828,7 @@ impl NoteApp {
             || self.deleted_win.is_some()
             || self.history_view.is_some()
             || self.import_win.is_some()
+            || self.move_win.is_some()
             || egui::Popup::is_any_open(ctx);
         let editing = self.mode == Mode::Edit;
         let Some(web) = self.web.as_mut() else { return };
@@ -1980,6 +2002,7 @@ impl eframe::App for NoteApp {
         self.history_window(&ctx);
         self.deleted_window(&ctx);
         self.history_view_window(&ctx);
+        self.move_window(&ctx);
         self.import_window(&ctx);
         if self.import_win.as_ref().is_some_and(|w| w.exit_ready()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

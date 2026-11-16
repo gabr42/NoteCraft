@@ -79,6 +79,12 @@ right side the page.
 Right-click a section or a page for more actions (rename, new subpage, print, show in File Explorer,
 delete). The **⋯** menu next to a page has the same actions plus **History…**.
 
+To move a page, drag it from the page list onto a section in the tree (it goes to the top of that
+section) or onto another page in the list (it becomes a subpage of that page). **Move to…** in the
+page's right-click or **⋯** menu does the same with a tree of all open folders. A page moves with
+its subpages, its saved versions and its pictures; a picture stays in the old section as long as
+another page there (or one of its versions, or a deleted page) still uses it.
+
 Folders can also be given on the command line: `NoteCraft.exe "U:\Notes" "D:\More notes"`.
 Removing a folder from the view (**Folders ▸ Remove … from view**) never touches its files.
 

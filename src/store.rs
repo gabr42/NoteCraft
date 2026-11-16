@@ -633,7 +633,7 @@ impl Index {
     }
 
     /// "Top-level folder › Section › ..." for a page.
-    fn place_of(&self, path: &Path) -> String {
+    pub(crate) fn place_of(&self, path: &Path) -> String {
         let dir = path.parent().unwrap_or(Path::new(""));
         let root = self.roots.iter().find(|r| dir.starts_with(r));
         // Strip the parent of the root, so the root's own name stays in front.
