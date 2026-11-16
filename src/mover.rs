@@ -6,9 +6,11 @@ use std::sync::LazyLock;
 
 /// Picture links: `](<resources/a b.png>)` and `<resources/a b.png>` (the editor writes names with
 /// spaces or parentheses this way; the name runs to `>`), and `](resources/x)`, `src="resources/x"`,
-/// `src='resources/x'`. Groups: 1+2 = angle form (prefix, name), 3+4 = plain form (prefix, name).
+/// `src='resources/x'`, each also with `./` before `resources`. Groups: 1+2 = angle form (prefix,
+/// name), 3+4 = plain form (prefix, name); the prefix includes the `./`.
 static LINK: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(\]\(<|<)resources/([^>\r\n]+)>|(\]\(|src="|src=')resources/([^)"'>\s]+)"#).expect("mover: link pattern")
+    regex::Regex::new(r#"((?:\]\(<|<)(?:\./)?)resources/([^>\r\n]+)>|((?:\]\(|src="|src=')(?:\./)?)resources/([^)"'>\s]+)"#)
+        .expect("mover: link pattern")
 });
 
 /// The prefix, the name as written and whether it is the angle form, of one link match.
@@ -162,6 +164,25 @@ pub fn can_move_to(page: &Path, target_dir: &Path) -> bool {
         && !is_within(target_dir, &crate::store::subpage_dir(page))
 }
 
+/// Whether two files hold the same bytes.
+fn same_bytes(a: &Path, b: &Path) -> bool {
+    matches!((fs::read(a), fs::read(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// Removes `dir` when it is the subpage folder of a page and nothing is left in it but empty
+/// `resources` and `.history` folders. A section folder is never removed.
+fn remove_if_empty_subpage_folder(dir: &Path) {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else { return };
+    if !parent.join(format!("{}.md", name.to_string_lossy())).is_file() {
+        return;
+    }
+    let history = dir.join(".history");
+    for d in [dir.join("resources"), history.join("pages"), history.join("deleted"), history] {
+        let _ = fs::remove_dir(d);
+    }
+    let _ = fs::remove_dir(dir);
+}
+
 /// `x.png` -> first free of `x-2.png`, `x-3.png` … in `dir`.
 fn free_picture_name(dir: &Path, name: &str) -> String {
     let (stem, ext) = match name.rfind('.') {
@@ -233,7 +254,7 @@ pub fn move_page(page: &Path, target_dir: &Path) -> Result<Option<PathBuf>, Stri
         }
         let mut dst = dst_res.join(&n);
         if dst.exists() {
-            if fs::read(&src).ok() == fs::read(&dst).ok() {
+            if same_bytes(&src, &dst) {
                 copied.push(n);
                 continue;
             }
@@ -290,6 +311,7 @@ pub fn move_page(page: &Path, target_dir: &Path) -> Result<Option<PathBuf>, Stri
             }
         }
     }
+    remove_if_empty_subpage_folder(src_dir);
     Ok(Some(new))
 }
 
@@ -339,6 +361,69 @@ mod tests {
     fn rewrite_keeps_angle_form() {
         let t = "![](<resources/a b.png>) ![](resources/a%20b.png)";
         assert_eq!(rewrite_picture_link(t, "a b.png", "a b-2.png"), "![](<resources/a b-2.png>) ![](resources/a%20b-2.png)");
+    }
+
+    #[test]
+    fn links_dot_slash_form() {
+        let t = "![](./resources/x.png) <img src=\"./resources/y.png\"> ![](<./resources/a b.png>)";
+        assert_eq!(picture_links(t), vec!["x.png", "y.png", "a b.png"]);
+        assert_eq!(
+            rewrite_picture_link(t, "x.png", "x-2.png"),
+            "![](./resources/x-2.png) <img src=\"./resources/y.png\"> ![](<./resources/a b.png>)"
+        );
+        assert_eq!(rewrite_picture_link("![](<./resources/a b.png>)", "a b.png", "c.png"), "![](<./resources/c.png>)");
+    }
+
+    #[test]
+    fn unreadable_pictures_are_not_the_same() {
+        let d = temp("same-bytes");
+        let (x, y, z) = (d.join("x.png"), d.join("y.png"), d.join("z.png"));
+        fs::write(&x, b"X").unwrap();
+        fs::write(&y, b"X").unwrap();
+        assert!(same_bytes(&x, &y));
+        assert!(!same_bytes(&x, &z));
+        assert!(!same_bytes(&z, &d.join("missing.png")));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn last_subpage_out_removes_empty_folder() {
+        let (d, a, b) = notebook("empty-sub");
+        let parent = page_with(&a, "P", "text");
+        let sub_dir = store_sub(&parent);
+        let child = page_with(&sub_dir, "C", "![](resources/x.png)");
+        pic(&sub_dir, "x.png", b"X");
+        version_of(&child, "old");
+        move_page(&child, &b).unwrap();
+        assert!(!sub_dir.exists(), "empty subpage folder left behind");
+        assert!(a.exists() && parent.exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn last_page_out_keeps_section() {
+        let (d, a, b) = notebook("keep-section");
+        let p = page_with(&a, "P", "![](resources/x.png)");
+        pic(&a, "x.png", b"X");
+        move_page(&p, &b).unwrap();
+        assert!(a.is_dir(), "section folder must stay");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn subpage_folder_with_other_files_stays() {
+        let (d, a, b) = notebook("sub-other");
+        let parent = page_with(&a, "P", "text");
+        let sub_dir = store_sub(&parent);
+        let child = page_with(&sub_dir, "C", "text");
+        fs::write(sub_dir.join("notes.txt"), "keep").unwrap();
+        move_page(&child, &b).unwrap();
+        assert!(sub_dir.join("notes.txt").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    fn store_sub(page: &Path) -> PathBuf {
+        crate::store::subpage_dir(page)
     }
 
     #[test]
