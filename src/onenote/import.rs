@@ -111,8 +111,10 @@ pub fn notebook_dir(src: &Path, target: &Path) -> PathBuf {
     target.join(name)
 }
 
-/// Absolute, with links resolved as far as the path exists, lower case for comparing.
-fn resolved(p: &Path) -> PathBuf {
+/// Absolute (a relative path is taken relative to `base`), with links resolved as far as the
+/// path exists, lower case for comparing.
+fn resolved(base: &Path, p: &Path) -> PathBuf {
+    let p = &if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
     let mut rest: Vec<std::ffi::OsString> = Vec::new();
     let mut cur = p.to_path_buf();
     let mut base = loop {
@@ -136,9 +138,15 @@ fn resolved(p: &Path) -> PathBuf {
 /// The import must never write into the source: refuse a target that is the source, lies inside
 /// it, or would put the notebook folder there.
 pub fn check_target(src: &Path, target: &Path) -> Result<(), String> {
-    let s = resolved(src);
+    let base = std::env::current_dir().map_err(|e| format!("onenote::check_target: no current folder: {e}"))?;
+    check_target_in(&base, src, target)
+}
+
+/// `check_target` with the folder that relative paths are taken from.
+fn check_target_in(base: &Path, src: &Path, target: &Path) -> Result<(), String> {
+    let s = resolved(base, src);
     for p in [target.to_path_buf(), notebook_dir(src, target)] {
-        if resolved(&p).starts_with(&s) {
+        if resolved(base, &p).starts_with(&s) {
             return Err(format!(
                 "onenote::check_target: the target folder {} is the source folder or lies inside it",
                 target.display()
@@ -415,6 +423,23 @@ mod tests {
         assert!(check_target(&src, &src.join("sub")).is_err());
         assert!(check_target(&src, &d).is_err(), "the notebook folder would be the source itself");
         assert!(check_target(&src, &d.join("out")).is_ok());
+    }
+
+    #[test]
+    fn relative_target_is_resolved_against_the_current_folder() {
+        let d = temp("relative");
+        let src = d.join("nb");
+        fs::create_dir_all(&src).unwrap();
+        // Current folder is the source: `out` and `.` would be written into it.
+        assert!(check_target_in(&src, &src, Path::new("out")).is_err());
+        assert!(check_target_in(&src, &src, Path::new(".")).is_err());
+        assert!(check_target_in(&src, Path::new("."), Path::new("out")).is_err());
+        // Current folder is a sibling: `out` is fine, and so is `../out` from the source.
+        assert!(check_target_in(&d, &src, Path::new("out")).is_ok());
+        assert!(check_target_in(&src, &src, Path::new("../out")).is_ok());
+        // The public function uses the real current folder; a relative nonexistent name is accepted
+        // only when the process is not running in the source.
+        assert!(check_target(&src, Path::new("notecraft-no-such-target-dir")).is_ok());
     }
 
     #[test]
