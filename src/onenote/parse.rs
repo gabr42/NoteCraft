@@ -32,6 +32,7 @@ pub const P_UNDER: u32 = 0x0800_1C06;
 pub const P_STRIKE: u32 = 0x0800_1C07;
 pub const P_SUPER: u32 = 0x0800_1C08;
 pub const P_SUB: u32 = 0x0800_1C09;
+#[allow(dead_code)] // listed with the other ids; the converter does not read it
 pub const P_HYPERLINK: u32 = 0x0800_1E14;
 pub const P_HIDDEN: u32 = 0x0800_1E16;
 pub const P_FONT: u32 = 0x1C00_1C0A;
@@ -41,10 +42,13 @@ pub const P_LIST_NODES: u32 = 0x2400_1C26;
 pub const P_NUMLIST_FMT: u32 = 0x1C00_1C1A;
 pub const P_PICTURE: u32 = 0x2000_1C3F;
 pub const P_IMG_ALT: u32 = 0x1C00_1E58;
+#[allow(dead_code)] // listed with the other ids; the converter does not read it
 pub const P_IMG_NAME: u32 = 0x1C00_1DD7;
 pub const P_EMB_CONT: u32 = 0x2000_1D9B;
 pub const P_EMB_NAME: u32 = 0x1C00_1D9C;
+#[allow(dead_code)] // listed with the other ids; the converter does not read it
 pub const P_ROWS: u32 = 0x1400_1D57;
+#[allow(dead_code)] // listed with the other ids; the converter does not read it
 pub const P_COLS: u32 = 0x1400_1D58;
 pub const P_OFF_H: u32 = 0x1400_1C14;
 pub const P_OFF_V: u32 = 0x1400_1C15;
@@ -54,19 +58,25 @@ pub const P_CHARSET: u32 = 0x0C00_1D01;
 pub const P_NOTETAG_STATES: u32 = 0x4000_3489;
 
 // --- object type ids (jcid) ---
+#[allow(dead_code)] // listed with the other ids; the converter does not read it
 pub const J_SECTION: u32 = 0x0006_0007;
 pub const J_PAGESERIES: u32 = 0x0006_0008;
 pub const J_PAGE: u32 = 0x0006_000B;
 pub const J_OUTLINE: u32 = 0x0006_000C;
+#[allow(dead_code)] // listed with the other ids; the converter does not read it
 pub const J_OE: u32 = 0x0006_000D;
 pub const J_RICHTEXT: u32 = 0x0006_000E;
 pub const J_IMAGE: u32 = 0x0006_0011;
+#[allow(dead_code)] // listed with the other ids; the converter does not read it
 pub const J_NUMLIST: u32 = 0x0006_0012;
 pub const J_TABLE: u32 = 0x0006_0022;
+#[allow(dead_code)] // listed with the other ids; the converter does not read it
 pub const J_ROW: u32 = 0x0006_0023;
+#[allow(dead_code)] // listed with the other ids; the converter does not read it
 pub const J_CELL: u32 = 0x0006_0024;
 pub const J_TITLE: u32 = 0x0006_002C;
 pub const J_EMBEDDED: u32 = 0x0006_0035;
+#[allow(dead_code)] // listed with the other ids; the converter does not read it
 pub const J_PAGEMANIFEST: u32 = 0x0006_0037;
 
 /// Bounds-checked little-endian reader over a byte slice.

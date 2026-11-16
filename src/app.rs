@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 mod history_ui;
+mod import_ui;
 
 const ACCENT: Color32 = Color32::from_rgb(0x6B, 0x2F, 0xA0);
 const ACCENT_DARK: Color32 = Color32::from_rgb(0x55, 0x22, 0x82);
@@ -91,6 +92,8 @@ enum Action {
     Refresh,
     /// Pick a folder and add it as another top-level folder.
     AddFolder,
+    /// Open the Import from OneNote wizard.
+    ImportOneNote,
     /// Show another top folder in the left column.
     SelectRoot(usize),
     /// Take a top-level folder out of the view (nothing is deleted on disk).
@@ -180,6 +183,11 @@ pub struct NoteApp {
     history_search: history_ui::HistorySearch,
     /// An old text opened from the search results.
     history_view: Option<history_ui::HistoryView>,
+    /// The Import from OneNote wizard.
+    import_win: Option<import_ui::ImportWin>,
+    /// The folders the wizard used last (remembered).
+    import_src: Option<PathBuf>,
+    import_dst: Option<PathBuf>,
 }
 
 impl NoteApp {
@@ -247,6 +255,9 @@ impl NoteApp {
             include_history: start_history,
             history_search: history_ui::HistorySearch::default(),
             history_view: None,
+            import_win: None,
+            import_src: settings.import_src.clone(),
+            import_dst: settings.import_dst.clone(),
         };
         let want_page = start_page.clone().or(settings.page.clone());
         if roots.is_empty()
@@ -400,6 +411,27 @@ impl NoteApp {
 
     fn reload_tree(&mut self) {
         self.trees = self.roots.iter().map(|r| store::scan_tree(r)).collect();
+    }
+
+    /// Reads the open page again from disk (it is closed when its file is gone).
+    fn reload_open_page(&mut self) {
+        if let Some(p) = self.page.take() {
+            if p.path.is_file() {
+                self.open_page(&p.path);
+            }
+        }
+    }
+
+    /// Back to viewing the page; call `save_if_dirty` first.
+    fn leave_edit(&mut self) {
+        if self.mode == Mode::Edit {
+            self.mode = Mode::View;
+            self.lock = None;
+            self.md_cache = CommonMarkCache::default();
+            if let Some(p) = &mut self.page {
+                p.display_src_len = usize::MAX;
+            }
+        }
     }
 
     fn open_page(&mut self, path: &Path) {
@@ -575,7 +607,14 @@ impl NoteApp {
         if self.screenshot.is_some() {
             return;
         }
-        Settings { roots: self.roots.clone(), page: self.page.as_ref().map(|p| p.path.clone()), sort: self.sort }.save();
+        Settings {
+            roots: self.roots.clone(),
+            page: self.page.as_ref().map(|p| p.path.clone()),
+            sort: self.sort,
+            import_src: self.import_src.clone(),
+            import_dst: self.import_dst.clone(),
+        }
+        .save();
     }
 
     fn run_search(&mut self) {
@@ -662,11 +701,7 @@ impl NoteApp {
                     self.save_if_dirty();
                     self.reload_tree();
                     self.reload_pages();
-                    if let Some(p) = self.page.take() {
-                        if p.path.is_file() {
-                            self.open_page(&p.path);
-                        }
-                    }
+                    self.reload_open_page();
                     self.start_indexing();
                     self.set_status("Notes reloaded from disk".into());
                 }
@@ -689,6 +724,7 @@ impl NoteApp {
                         self.add_root(dir);
                     }
                 }
+                Action::ImportOneNote => self.open_import(),
                 Action::SelectRoot(i) => {
                     if i < self.roots.len() && i != self.active {
                         self.save_if_dirty();
@@ -708,14 +744,7 @@ impl NoteApp {
 
     fn show_dialog(&mut self, d: Dialog) {
         self.save_if_dirty();
-        if self.mode == Mode::Edit {
-            self.mode = Mode::View;
-            self.lock = None;
-            self.md_cache = CommonMarkCache::default();
-            if let Some(p) = &mut self.page {
-                p.display_src_len = usize::MAX;
-            }
-        }
+        self.leave_edit();
         self.dialog = Some(d);
         self.dialog_error.clear();
         self.focus_dialog = true;
@@ -762,6 +791,10 @@ impl NoteApp {
                 let (b, _) = egui::containers::menu::MenuButton::from_button(top_button("📁  Folders ▾")).ui(ui, |ui| {
                     if ui.button("Add folder…").clicked() {
                         self.actions.push(Action::AddFolder);
+                        ui.close();
+                    }
+                    if ui.button("Import from OneNote…").on_hover_text("Convert a OneNote notebook (.one files) into pages").clicked() {
+                        self.actions.push(Action::ImportOneNote);
                         ui.close();
                     }
                     if !roots.is_empty() {
@@ -1577,7 +1610,7 @@ impl NoteApp {
                 i.key_pressed(Key::Escape),
             )
         });
-        if self.dialog.is_some() {
+        if self.dialog.is_some() || self.import_win.is_some() {
             return;
         }
         if find {
@@ -1769,7 +1802,12 @@ impl NoteApp {
             }
         }
         // egui dialogs and menus are drawn under the page view, so it steps aside for them.
-        let covered = self.dialog.is_some() || self.history_win.is_some() || self.deleted_win.is_some() || self.history_view.is_some() || egui::Popup::is_any_open(ctx);
+        let covered = self.dialog.is_some()
+            || self.history_win.is_some()
+            || self.deleted_win.is_some()
+            || self.history_view.is_some()
+            || self.import_win.is_some()
+            || egui::Popup::is_any_open(ctx);
         let editing = self.mode == Mode::Edit;
         let Some(web) = self.web.as_mut() else { return };
         if ctx.input(|i| i.pointer.any_pressed()) {
@@ -1924,6 +1962,9 @@ impl eframe::App for NoteApp {
             self.save_if_dirty();
             self.lock = None;
             self.remember();
+            if let Some(w) = &mut self.import_win {
+                w.stop_before_exit();
+            }
         }
 
         self.top_bar(ui);
@@ -1937,6 +1978,7 @@ impl eframe::App for NoteApp {
         self.history_window(&ctx);
         self.deleted_window(&ctx);
         self.history_view_window(&ctx);
+        self.import_window(&ctx);
         self.history_search_tick(&ctx);
         self.apply_actions();
         self.sync_web(frame, &ctx);
@@ -2221,6 +2263,9 @@ struct Settings {
     roots: Vec<PathBuf>,
     page: Option<PathBuf>,
     sort: SortOrder,
+    /// The folders the Import from OneNote wizard used last.
+    import_src: Option<PathBuf>,
+    import_dst: Option<PathBuf>,
 }
 
 impl Settings {
@@ -2229,7 +2274,7 @@ impl Settings {
     }
 
     fn load() -> Settings {
-        let mut s = Settings { roots: Vec::new(), page: None, sort: SortOrder::Name };
+        let mut s = Settings { roots: Vec::new(), page: None, sort: SortOrder::Name, import_src: None, import_dst: None };
         let Some(text) = Self::file().and_then(|f| std::fs::read_to_string(f).ok()) else { return s };
         for line in text.lines() {
             match line.split_once('=') {
@@ -2237,6 +2282,8 @@ impl Settings {
                 Some(("page", v)) if !v.is_empty() => s.page = Some(PathBuf::from(v)),
                 Some(("sort", "created")) => s.sort = SortOrder::Created,
                 Some(("sort", "updated")) => s.sort = SortOrder::Updated,
+                Some(("import_src", v)) if !v.is_empty() => s.import_src = Some(PathBuf::from(v)),
+                Some(("import_dst", v)) if !v.is_empty() => s.import_dst = Some(PathBuf::from(v)),
                 _ => {}
             }
         }
@@ -2254,11 +2301,16 @@ impl Settings {
             SortOrder::Updated => "updated",
         };
         let roots: String = self.roots.iter().map(|p| format!("root={}\n", p.display())).collect();
-        let text = format!(
+        let mut text = format!(
             "{roots}page={}\nsort={}\n",
             self.page.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             sort
         );
+        for (key, value) in [("import_src", &self.import_src), ("import_dst", &self.import_dst)] {
+            if let Some(v) = value {
+                text.push_str(&format!("{key}={}\n", v.display()));
+            }
+        }
         let _ = std::fs::write(f, text);
     }
 }
