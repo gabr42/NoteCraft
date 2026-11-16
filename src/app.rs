@@ -192,6 +192,8 @@ pub struct NoteApp {
     import_win: Option<import_ui::ImportWin>,
     /// The "Move to…" dialog.
     move_win: Option<move_ui::MoveDialog>,
+    /// A dragged page is over a row it may be dropped on (set by `page_drop_target` this frame).
+    drop_allowed: bool,
     /// The folders the wizard used last (remembered).
     import_src: Option<PathBuf>,
     import_dst: Option<PathBuf>,
@@ -264,6 +266,7 @@ impl NoteApp {
             history_view: None,
             import_win: None,
             move_win: None,
+            drop_allowed: false,
             import_src: settings.import_src.clone(),
             import_dst: settings.import_dst.clone(),
         };
@@ -2006,7 +2009,7 @@ impl eframe::App for NoteApp {
         self.deleted_window(&ctx);
         self.history_view_window(&ctx);
         self.move_window(&ctx);
-        self.drag_label(&ctx);
+        self.drag_feedback(&ctx);
         self.import_window(&ctx);
         if self.import_win.as_ref().is_some_and(|w| w.exit_ready()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

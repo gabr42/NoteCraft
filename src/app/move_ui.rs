@@ -41,20 +41,23 @@ impl NoteApp {
         if !mover::can_move_to(&p.0, target_dir) {
             return;
         }
+        self.drop_allowed = true;
         ui.painter().rect_stroke(resp.rect, CornerRadius::same(4), Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
         if let Some(p) = resp.dnd_release_payload::<DragPage>() {
             self.actions.push(Action::MovePage { page: p.0.clone(), target_dir: target_dir.to_path_buf() });
         }
     }
 
-    /// The title of the dragged page next to the pointer.
-    pub(super) fn drag_label(&self, ctx: &egui::Context) {
+    /// While a page is dragged: the cursor, and the page title next to the pointer.
+    /// Runs after all drop targets of the frame (they set `drop_allowed`).
+    pub(super) fn drag_feedback(&mut self, ctx: &egui::Context) {
+        let allowed = std::mem::take(&mut self.drop_allowed);
         let Some(p) = egui::DragAndDrop::payload::<DragPage>(ctx) else { return };
-        // egui shows `Grabbing` while dragging, which winit maps to the four-arrow IDC_SIZEALL on
-        // Windows. Windows drags use the plain arrow; `Alias` is a non-default icon (so egui keeps
-        // it) that winit maps to IDC_ARROW.
+        // Like Explorer: the arrow where the page may be dropped, "no entry" everywhere else.
+        // egui's own drag cursor (`Grabbing`) is the four-arrow IDC_SIZEALL on Windows.
+        // `Alias` is a non-default icon (so egui keeps it) that winit maps to IDC_ARROW.
         #[cfg(windows)]
-        ctx.set_cursor_icon(egui::CursorIcon::Alias);
+        ctx.set_cursor_icon(if allowed { egui::CursorIcon::Alias } else { egui::CursorIcon::NoDrop });
         let Some(pos) = ctx.pointer_latest_pos() else { return };
         egui::Area::new(Id::unique("drag-page"))
             .order(egui::Order::Tooltip)
