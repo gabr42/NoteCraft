@@ -53,11 +53,10 @@ impl NoteApp {
     pub(super) fn drag_feedback(&mut self, ctx: &egui::Context) {
         let allowed = std::mem::take(&mut self.drop_allowed);
         let Some(p) = egui::DragAndDrop::payload::<DragPage>(ctx) else { return };
-        // Like Explorer: the arrow where the page may be dropped, "no entry" everywhere else.
-        // egui's own drag cursor (`Grabbing`) is the four-arrow IDC_SIZEALL on Windows.
-        // `Alias` is a non-default icon (so egui keeps it) that winit maps to IDC_ARROW.
-        #[cfg(windows)]
-        ctx.set_cursor_icon(if allowed { egui::CursorIcon::Alias } else { egui::CursorIcon::NoDrop });
+        // "No entry" where the page cannot be dropped; elsewhere egui's own drag cursor stays.
+        if !allowed {
+            ctx.set_cursor_icon(egui::CursorIcon::NoDrop);
+        }
         let Some(pos) = ctx.pointer_latest_pos() else { return };
         egui::Area::new(Id::unique("drag-page"))
             .order(egui::Order::Tooltip)
