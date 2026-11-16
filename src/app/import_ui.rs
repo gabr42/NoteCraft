@@ -545,7 +545,7 @@ impl NoteApp {
                 Step::Run => win.run_step(ui, &mut close),
             }
         });
-        if modal.should_close() {
+        if outside_close(modal.should_close(), win.running()) {
             close = true;
         }
         let mut start = false;
@@ -575,6 +575,12 @@ impl NoteApp {
         }
         self.import_win = Some(win);
     }
+}
+
+/// Esc or a click beside the window closes it, but not while the import runs: only the Cancel
+/// button cancels then.
+fn outside_close(should_close: bool, running: bool) -> bool {
+    should_close && !running
 }
 
 #[cfg(test)]
@@ -705,6 +711,13 @@ mod tests {
         assert!(w.next_from_target(true), "not asked again after Yes");
         w.target = Ok(PathBuf::from(r"D:\Other\Book"));
         assert!(!w.next_from_target(true), "another folder is asked about");
+    }
+
+    #[test]
+    fn click_outside_or_esc_does_not_cancel_a_running_import() {
+        assert!(outside_close(true, false));
+        assert!(!outside_close(true, true));
+        assert!(!outside_close(false, false));
     }
 
     #[test]

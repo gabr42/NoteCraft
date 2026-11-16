@@ -111,12 +111,17 @@ pub fn notebook_dir(src: &Path, target: &Path) -> PathBuf {
     target.join(name)
 }
 
-/// Absolute (a relative path is taken relative to `base`), with links resolved as far as the
-/// path exists, lower case for comparing.
-fn resolved(base: &Path, p: &Path) -> PathBuf {
-    let p = &if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
+/// Absolute (a relative path is taken relative to `base`) with `.` and `..` removed from the text,
+/// then with links resolved as far as the path exists, lower case for comparing. `None` when no
+/// absolute form can be made: the caller must refuse such a path.
+fn resolved(base: &Path, p: &Path) -> Option<PathBuf> {
+    let joined = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
+    let p = std::path::absolute(&joined).ok()?;
+    if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return None;
+    }
     let mut rest: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = p.to_path_buf();
+    let mut cur = p.clone();
     let mut base = loop {
         if let Ok(c) = cur.canonicalize() {
             break c;
@@ -126,17 +131,18 @@ fn resolved(base: &Path, p: &Path) -> PathBuf {
                 rest.push(n);
                 cur = parent;
             }
-            _ => break p.to_path_buf(),
+            // Nothing of the path exists, not even its root: use the normalised absolute form.
+            _ => break cur,
         }
     };
     for n in rest.iter().rev() {
         base.push(n);
     }
-    PathBuf::from(base.to_string_lossy().to_lowercase())
+    Some(PathBuf::from(base.to_string_lossy().to_lowercase()))
 }
 
 /// The import must never write into the source: refuse a target that is the source, lies inside
-/// it, or would put the notebook folder there.
+/// it, or would put the notebook folder there, and a source that lies inside the notebook folder.
 pub fn check_target(src: &Path, target: &Path) -> Result<(), String> {
     let base = std::env::current_dir().map_err(|e| format!("onenote::check_target: no current folder: {e}"))?;
     check_target_in(&base, src, target)
@@ -144,25 +150,33 @@ pub fn check_target(src: &Path, target: &Path) -> Result<(), String> {
 
 /// `check_target` with the folder that relative paths are taken from.
 fn check_target_in(base: &Path, src: &Path, target: &Path) -> Result<(), String> {
-    let s = resolved(base, src);
-    for p in [target.to_path_buf(), notebook_dir(src, target)] {
-        if resolved(base, &p).starts_with(&s) {
-            return Err(format!(
-                "onenote::check_target: the target folder {} is the source folder or lies inside it",
-                target.display()
-            ));
-        }
+    let refuse = || {
+        Err(format!(
+            "onenote::check_target: the target folder {} is the source folder or lies inside it",
+            target.display()
+        ))
+    };
+    let nb = notebook_dir(src, target);
+    let (Some(s), Some(t), Some(n)) = (resolved(base, src), resolved(base, target), resolved(base, &nb)) else {
+        return Err(format!(
+            "onenote::check_target: cannot tell whether the target folder {} lies inside the source",
+            target.display()
+        ));
+    };
+    if t.starts_with(&s) || n.starts_with(&s) || s.starts_with(&n) {
+        return refuse();
     }
     Ok(())
 }
 
 /// Writes `(file stem, markdown)` pairs into `dir`. A page whose text is unchanged is left alone;
 /// a page that is replaced is first kept in the history; a page that is locked by another
-/// computer or cannot be kept in the history is skipped and listed.
-pub fn write_section(dir: &Path, pages: &[(String, String)], report: &mut Report) {
+/// computer or cannot be kept in the history is skipped and listed, and so is a page whose existing
+/// file cannot be read. Returns false (and lists the problem) when the folder cannot be created.
+pub fn write_section(dir: &Path, pages: &[(String, String)], report: &mut Report) -> bool {
     if let Err(e) = std::fs::create_dir_all(dir) {
         report.problems.push(format!("{}: could not create the folder: {e}", dir.display()));
-        return;
+        return false;
     }
     for (stem, md) in pages {
         let path = dir.join(format!("{stem}.md"));
@@ -194,6 +208,7 @@ pub fn write_section(dir: &Path, pages: &[(String, String)], report: &mut Report
             Err(e) => report.problems.push(format!("{}: could not write the page: {e}", path.display())),
         }
     }
+    true
 }
 
 /// Only `.` and ASCII letters and digits, at most 10 characters after the dot; empty when nothing
@@ -246,8 +261,10 @@ pub fn import(src: &Path, target: &Path, progress: &dyn Fn(Progress), cancel: &A
             out_dir = match out_dirs.get(&src_dir) {
                 Some(o) => o.clone(),
                 None => {
-                    let name =
-                        allocators.entry(out_dir.clone()).or_default().take(&plain_name(&c.as_os_str().to_string_lossy()));
+                    let name = allocators
+                        .entry(out_dir.clone())
+                        .or_insert_with(NameAllocator::folders)
+                        .take(&plain_name(&c.as_os_str().to_string_lossy()));
                     let o = out_dir.join(name);
                     out_dirs.insert(src_dir.clone(), o.clone());
                     o
@@ -256,7 +273,8 @@ pub fn import(src: &Path, target: &Path, progress: &dyn Fn(Progress), cancel: &A
         }
         let file_name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let stem = &file_name[..file_name.len() - 4];
-        let sec_dir = out_dir.join(allocators.entry(out_dir.clone()).or_default().take(&plain_name(stem)));
+        let sec_name = allocators.entry(out_dir.clone()).or_insert_with(NameAllocator::folders).take(&plain_name(stem));
+        let sec_dir = out_dir.join(sec_name);
 
         let data = match std::fs::read(file) {
             Ok(d) => d,
@@ -309,8 +327,11 @@ pub fn import(src: &Path, target: &Path, progress: &dyn Fn(Progress), cancel: &A
         match converted {
             Ok((list, warnings)) => {
                 report.problems.extend(warnings.into_iter().map(|w| format!("{place} › {w}")));
-                write_section(&sec_dir, &list, &mut report);
-                report.sections += 1;
+                if write_section(&sec_dir, &list, &mut report) {
+                    report.sections += 1;
+                } else {
+                    report.sections_failed += 1;
+                }
             }
             Err(e) => {
                 report.problems.push(format!("{place}: {e}"));
@@ -426,6 +447,31 @@ mod tests {
     }
 
     #[test]
+    fn target_with_dot_dot_is_normalised() {
+        let d = temp("dotdot");
+        let src = d.join("nb");
+        fs::create_dir_all(&src).unwrap();
+        let ends_in = d.join("nb").join("new1").join("new2").join("..");
+        assert!(check_target(&src, &ends_in).is_err(), "ends in `..` below the source");
+        let detour = d.join("newdir").join("..").join("nb").join("x");
+        assert!(check_target(&src, &detour).is_err(), "`..` leads back into the source");
+        let sibling = d.join("other").join("..").join("out");
+        assert!(check_target(&src, &sibling).is_ok());
+        // a path that exists nowhere is still compared in the same form
+        assert!(check_target(&src, Path::new(r"Q:\no\such\drive\..\..\x")).is_ok());
+    }
+
+    #[test]
+    fn source_inside_the_notebook_folder_is_refused() {
+        let d = temp("srcinnb");
+        // target d\T gives the notebook folder d\T\nb, which holds the source d\T\nb\nb
+        let src = d.join("T").join("nb").join("nb");
+        fs::create_dir_all(&src).unwrap();
+        assert!(check_target(&src, &d.join("T")).is_err());
+        assert!(check_target(&src, &d.join("U")).is_ok());
+    }
+
+    #[test]
     fn relative_target_is_resolved_against_the_current_folder() {
         let d = temp("relative");
         let src = d.join("nb");
@@ -440,6 +486,29 @@ mod tests {
         // The public function uses the real current folder; a relative nonexistent name is accepted
         // only when the process is not running in the source.
         assert!(check_target(&src, Path::new("notecraft-no-such-target-dir")).is_ok());
+    }
+
+    #[test]
+    fn section_folder_that_cannot_be_created_is_a_failure() {
+        let d = temp("nofolder");
+        let mut r = Report::default();
+        // `sec` is an existing file, so create_dir_all fails
+        let f = d.join("sec");
+        fs::write(&f, b"x").unwrap();
+        assert!(!write_section(&f, &pages(&[("A", "one")]), &mut r));
+        assert_eq!(r.problems.len(), 1);
+        assert!(r.problems[0].contains("could not create the folder"));
+        assert!(write_section(&d.join("ok"), &pages(&[("A", "one")]), &mut r));
+    }
+
+    #[test]
+    fn hidden_looking_section_names_land_in_visible_folders() {
+        let mut a = NameAllocator::folders();
+        let names: Vec<String> = [".NET", "Attachments", "resources", "_resources"].iter().map(|n| a.take(n)).collect();
+        assert_eq!(names, ["_.NET", "Attachments-1", "resources-1", "_resources-1"]);
+        assert!(names.iter().all(|n| !crate::store::is_hidden_folder(n)));
+        // pages keep the dot
+        assert_eq!(NameAllocator::new().take(&safe(".NET tips")), ".NET tips");
     }
 
     #[test]

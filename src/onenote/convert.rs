@@ -98,31 +98,43 @@ pub fn safe(s: &str) -> String {
     if name.is_empty() { UNTITLED_PAGE.to_string() } else { name.to_string() }
 }
 
-/// Hands out unique names within one folder (case-insensitive).
+/// Hands out unique names within one folder (case-insensitive). Two modes: page file names
+/// (`new`), where only `resources` gets a suffix, and folder names (`folders`), where a leading `.`
+/// becomes `_.` and every name that NoteCraft hides gets a suffix.
 #[derive(Default)]
 pub struct NameAllocator {
     used: HashSet<String>,
+    folders: bool,
 }
 
 impl NameAllocator {
+    /// Allocator for page file names.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// True for names that always get a suffix: `resources` (any case) and names starting with `.`.
-    pub fn reserved(name: &str) -> bool {
-        name.eq_ignore_ascii_case("resources") || name.starts_with('.')
+    /// Allocator for section and group folder names.
+    pub fn folders() -> Self {
+        Self { used: HashSet::new(), folders: true }
     }
 
-    /// Returns `name`, then `name-1`, `name-2`, ... for repeated (case-insensitive) requests.
+    /// True for names that always get a suffix: `resources` (any case) and, for folders, every name
+    /// that `store::is_hidden_folder` hides.
+    fn reserved(&self, name: &str) -> bool {
+        name.eq_ignore_ascii_case("resources") || (self.folders && crate::store::is_hidden_folder(name))
+    }
+
+    /// Returns `name`, then `name-1`, `name-2`, ... for repeated (case-insensitive) requests. In
+    /// folder mode a leading `.` is first changed to `_.` so that the folder is not hidden.
     pub fn take(&mut self, name: &str) -> String {
-        let plain = !Self::reserved(name) && !self.used.contains(&name.to_lowercase());
+        let name = if self.folders && name.starts_with('.') { format!("_{name}") } else { name.to_string() };
+        let plain = !self.reserved(&name) && !self.used.contains(&name.to_lowercase());
         let result = if plain {
-            name.to_string()
+            name
         } else {
             (1..)
                 .map(|n| format!("{name}-{n}"))
-                .find(|c| !self.used.contains(&c.to_lowercase()))
+                .find(|c| !self.reserved(c) && !self.used.contains(&c.to_lowercase()))
                 .unwrap()
         };
         self.used.insert(result.to_lowercase());
@@ -809,7 +821,28 @@ mod tests {
         assert_eq!(a.take("plan"), "plan-1");
         assert_eq!(a.take("Plan"), "Plan-2");
         assert_eq!(a.take("resources"), "resources-1");
-        assert_eq!(a.take(".x"), ".x-1");
+        // page names: a leading dot does not hide a page
+        assert_eq!(a.take(".NET tips"), ".NET tips");
+        assert_eq!(a.take(".net tips"), ".net tips-1");
+        assert_eq!(a.take("attachments"), "attachments");
+    }
+
+    #[test]
+    fn folder_allocator() {
+        let mut a = NameAllocator::folders();
+        assert_eq!(a.take("Plan"), "Plan");
+        assert_eq!(a.take("plan"), "plan-1");
+        // a leading dot gets `_`, and `-1` only when that name is taken
+        assert_eq!(a.take(".NET"), "_.NET");
+        assert_eq!(a.take(".net"), "_.net-1");
+        // names that NoteCraft hides get a suffix, which is not hidden itself
+        assert_eq!(a.take("resources"), "resources-1");
+        assert_eq!(a.take("Attachments"), "Attachments-1");
+        assert_eq!(a.take("_resources"), "_resources-1");
+        assert_eq!(a.take("attachments"), "attachments-2");
+        for n in ["_.NET", "resources-1", "Attachments-1", "_resources-1"] {
+            assert!(!crate::store::is_hidden_folder(n), "{n}");
+        }
     }
 
     #[test]

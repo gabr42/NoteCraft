@@ -681,9 +681,12 @@ impl Parser<'_> {
                 let a = r.u32_at(pos)?;
                 let n = r.u32_at(pos + 4)?;
                 let b = r.u32_at(pos + 8)?;
-                for i in 0..n {
-                    let (Some(ai), Some(bi)) = (a.checked_add(i), b.checked_add(i)) else { break };
-                    if let Some(g) = self.dep_table.get(&ai) {
+                // `n` comes from the file: walk the entries that exist, not the `n` indexes.
+                for (k, g) in &self.dep_table {
+                    if let Some(i) = k.checked_sub(a)
+                        && i < n
+                        && let Some(bi) = b.checked_add(i)
+                    {
                         self.table.borrow_mut().insert(bi, *g);
                     }
                 }
@@ -1030,6 +1033,37 @@ mod tests {
         d[264..272].copy_from_slice(&184u64.to_le_bytes());
         d[272..276].copy_from_slice(&100u32.to_le_bytes());
         assert!(OneFile::parse(&d).is_err());
+    }
+
+    #[test]
+    fn global_id_entry3_is_bounded_by_the_table() {
+        // a = 5, b = 50; `n` = 4, or 4 billion (which would otherwise mean 4 billion lookups)
+        for n in [4u32, u32::MAX] {
+            let mut buf = Vec::new();
+            for v in [5u32, n, 50] {
+                buf.extend(v.to_le_bytes());
+            }
+            let mut p = Parser {
+                r: Rd::new(&buf),
+                spaces: HashMap::new(),
+                root_gosid: None,
+                filedata: HashMap::new(),
+                cur: None,
+                currev: None,
+                table: Rc::new(RefCell::new(HashMap::new())),
+                saved_tables: Vec::new(),
+                dep_table: HashMap::from([(5u32, [1u8; 16]), (7, [2; 16]), (100, [3; 16])]),
+                active: HashSet::new(),
+                nodes: 0,
+            };
+            let t = std::time::Instant::now();
+            p.node(0x26, 0, 0, 0, 0).unwrap();
+            assert!(t.elapsed().as_secs() < 5);
+            let tab = p.table.borrow();
+            assert_eq!(tab.get(&50), Some(&[1u8; 16]));
+            assert_eq!(tab.get(&52), Some(&[2u8; 16]));
+            assert_eq!(tab.get(&145).is_some(), n == u32::MAX, "entry 100 is in range only for a huge n");
+        }
     }
 
     #[test]

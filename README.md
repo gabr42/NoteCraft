@@ -134,12 +134,12 @@ folder of `.one` files; they are only read, never changed.
 
 Choose **Folders ▸ Import from OneNote…**. The window has three steps:
 
-1. **OneNote notebook.** Type or browse to the folder with the notebook's `.one` files. The window
+1. **OneNote notebook.** Type or browse to the folder with the notebook's `.one` files (a full path). The window
    shows how many sections it found, for example "Found 14 sections in 3 folders." Next is enabled
    when there is at least one section. The `OneNote_RecycleBin` folder is skipped.
 2. **Target folder.** Type or browse to the folder to write into. The notebook is written to a
    subfolder named like the source folder, and the window shows that path. The target must be a full
-   path (relative paths are refused) and must not be the source folder or inside it. If the
+   path (relative paths are refused) and must not be the source folder or inside it, and the source must not be inside the notebook's folder. If the
    notebook's folder already holds anything, NoteCraft asks once before it goes on: pages that
    already exist will be replaced, and their current text is kept in their history.
 3. **Import.** A progress bar shows the section being written. Cancel stops after the section being
@@ -150,8 +150,11 @@ When the import is done the target folder is added to the folders (or, if it can
 view is reloaded) and the imported notebook is selected.
 
 Every OneNote section becomes a folder of pages, and the folders of the source become folders around
-them. A section or folder whose name is already taken, or is called `resources` or starts with a
-dot, gets `-1`, `-2` ... added to its name; pages with the same title are numbered the same way.
+them. A section or folder whose name is already taken gets `-1`, `-2` ... added to its name. A name
+that starts with a dot gets `_` in front (`.NET` becomes `_.NET`), and a name NoteCraft hides
+(`resources`, `_resources`, `attachments`) gets the number, so that the folder is shown. Pages with
+the same title are numbered the same way, and a page called `resources` too; a page that starts
+with a dot keeps its name.
 Pictures and attachments are saved in a `resources` folder inside each section's folder.
 
 Importing the same notebook again is safe:
@@ -170,7 +173,8 @@ NoteCraft.exe --import-onenote "E:\OneNote\Work" "D:\Notes"
 ```
 
 It prints a line per section and then the summary. The exit code is 0 when every section was
-imported, 1 when a section failed, and 2 when a folder is missing from the command line.
+imported, 1 when a section failed or the target was refused, and 2 when a folder is missing from
+the command line.
 
 The import is a port of the Python converter in `tools\onenote-import`, which is kept as the
 reference implementation. The output is the same page for page, with these deliberate differences:
@@ -196,7 +200,7 @@ notebook folders; see the [tool's README](tools/onenote-import/README.md).
 | `src\store.rs`       | Reading and writing folders and pages, the search index      |
 | `src\history.rs`     | Versions, deleted items, purge and history search            |
 | `src\lock.rs`        | Edit locks for shared folders                                |
-| `src\onenote\`       | OneNote import: `.one` parser, conversion, writing pages    |
+| `src\onenote\`       | OneNote import: `.one` parser, conversion, writing pages     |
 | `src\render.rs`      | Markdown to HTML for viewing, searching and printing         |
 | `src\web.rs`         | The WebView2 page view                                       |
 | `assets\editor.*`    | The page view's HTML, CSS and JavaScript                     |
