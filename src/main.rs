@@ -3,6 +3,7 @@
 mod app;
 mod history;
 mod lock;
+mod mover;
 mod onenote;
 mod render;
 mod store;
