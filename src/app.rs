@@ -1,6 +1,7 @@
 //! The NoteCraft window: notebooks and sections on the left, pages in the middle, the page on the right.
 
 use crate::lock::{self, EditLock};
+use crate::mover;
 use crate::render;
 use crate::store::{self, Folder, Index, PageEntry, SearchHit, SortOrder};
 use crate::web::{self, PageWeb, WebMsg};
@@ -45,6 +46,13 @@ enum Mode {
     Edit,
 }
 
+/// The open page as `release_open_page` closed it, for `reopen`.
+pub(super) struct Released {
+    path: PathBuf,
+    /// It was in edit mode.
+    editing: bool,
+}
+
 struct OpenPage {
     path: PathBuf,
     title: String,
@@ -85,6 +93,10 @@ enum Action {
     ShowMove(PathBuf),
     /// Move a page into a folder (a section, or the subpage folder of another page).
     MovePage { page: PathBuf, target_dir: PathBuf },
+    /// Open the "Move to…" dialog for a section.
+    ShowMoveSection(PathBuf),
+    /// Move a section folder into another folder.
+    MoveSection { folder: PathBuf, target: PathBuf },
     NewSection(PathBuf),
     RenameSection(PathBuf),
     DeleteSection(PathBuf),
@@ -477,16 +489,19 @@ impl NoteApp {
         }
     }
 
-    fn save_if_dirty(&mut self) {
-        let Some(p) = &mut self.page else { return };
+    /// Saves the open page when its text changed. Returns true when the page was clean or its text
+    /// was written to its own file; false when the text was not saved, was kept as a conflict copy,
+    /// or was thrown away because another computer is editing the page.
+    fn save_if_dirty(&mut self) -> bool {
+        let Some(p) = &mut self.page else { return true };
         if p.body == p.saved_body {
-            return;
+            return true;
         }
         // Never overwrite work from another computer.
         let editing_here = self.lock.as_ref().is_some_and(|l| l.page == p.path);
         if editing_here && !self.lock.as_ref().is_some_and(|l| l.still_mine()) {
             self.save_conflict("Another computer took over editing of this page.");
-            return;
+            return false;
         }
         if !editing_here && let Some(h) = lock::held_by_other(&p.path) {
             p.body = p.saved_body.clone();
@@ -494,11 +509,11 @@ impl NoteApp {
             p.display_src_len = usize::MAX;
             self.md_cache = CommonMarkCache::default();
             self.show_message("Page in use", format!("Your change was not saved: this page is being edited {}.", h.describe()));
-            return;
+            return false;
         }
         if p.path.exists() && lock::stamp(&p.path) != p.stamp {
             self.save_conflict("The page was changed on another computer while you were working on it.");
-            return;
+            return false;
         }
         match store::save_body(&p.path, &p.body) {
             Ok(()) => {
@@ -513,9 +528,77 @@ impl NoteApp {
                     Some(w) => self.set_status(format!("Saved, but the history copy failed: {w}")),
                     None => self.set_status("Saved".into()),
                 }
+                true
             }
-            Err(e) => self.set_status(e),
+            Err(e) => {
+                self.set_status(e);
+                false
+            }
         }
+    }
+
+    /// Before a page or folder operation: when the open page matches `inside`, saves it, drops this
+    /// computer's edit lock and closes it. Returns what is needed to open it again (`reopen`).
+    /// Refuses (and changes nothing more) when its text did not reach its own file: a failed save keeps
+    /// the text only in the open page, and a conflict copy lies next to the page, where a delete or move
+    /// of the folder would take it along unseen.
+    pub(super) fn release_open_page(&mut self, inside: impl Fn(&Path) -> bool) -> Result<Option<Released>, String> {
+        if !self.page.as_ref().is_some_and(|p| inside(&p.path)) {
+            return Ok(None);
+        }
+        if !self.save_if_dirty() {
+            return Err("The open page could not be saved, so nothing was changed. Check the page first.".into());
+        }
+        let editing = self.mode == Mode::Edit;
+        self.leave_edit();
+        Ok(self.page.take().map(|p| Released { path: p.path, editing }))
+    }
+
+    /// Opens a page closed by `release_open_page` at `path` (its old or new place), in edit mode again
+    /// when it was being edited.
+    pub(super) fn reopen(&mut self, released: &Released, path: &Path) {
+        self.open_page(path);
+        if released.editing && self.page.as_ref().is_some_and(|p| p.path == path) {
+            self.start_edit();
+        }
+    }
+
+    /// Moves or renames the folder `folder` with `op`, which returns its new path (`None`: nothing was
+    /// done). The open page inside it is saved first and opened again afterwards, at the new place on
+    /// success and at the old one otherwise; the index, the selection and the tree follow the folder.
+    pub(super) fn relocate_folder(
+        &mut self,
+        folder: &Path,
+        op: impl FnOnce() -> Result<Option<PathBuf>, String>,
+    ) -> Result<Option<PathBuf>, String> {
+        folder_free(folder)?;
+        let open = self.release_open_page(|p| mover::is_within(p, folder))?;
+        let new = match op() {
+            Ok(Some(new)) => new,
+            other => {
+                if let Some(r) = &open {
+                    self.reopen(r, &r.path.clone());
+                }
+                return other;
+            }
+        };
+        self.index.remove_tree(folder);
+        self.index.add_tree(&new);
+        self.index_stale = true;
+        if let Some(sel) = self.selected_folder.clone()
+            && let Some(moved) = mover::rebase(&sel, folder, &new)
+        {
+            self.selected_folder = Some(moved);
+            // The selection follows the folder, also into another notebook.
+            self.show_root_of(&new);
+        }
+        self.reload_tree();
+        self.reload_pages();
+        if let Some(r) = open {
+            let moved = mover::rebase(&r.path, folder, &new).unwrap_or(r.path.clone());
+            self.reopen(&r, &moved);
+        }
+        Ok(Some(new))
     }
 
     /// Keeps the text from here as a separate page instead of overwriting the other version.
@@ -671,6 +754,12 @@ impl NoteApp {
                         self.show_message("Move page", e);
                     }
                 }
+                Action::ShowMoveSection(f) => self.open_move_section(f),
+                Action::MoveSection { folder, target } => {
+                    if let Err(e) = self.do_move_section(&folder, &target) {
+                        self.show_message("Move section", e);
+                    }
+                }
                 Action::DeletePage(p) => {
                     let title = store::read_doc(&p).map(|d| d.title_or(&p)).unwrap_or_default();
                     let subpages = store::subpage_dir(&p).is_dir();
@@ -713,7 +802,9 @@ impl NoteApp {
                         p.display_src_len = usize::MAX;
                     }
                 }
-                Action::Save => self.save_if_dirty(),
+                Action::Save => {
+                    self.save_if_dirty();
+                }
                 Action::Refresh => {
                     self.save_if_dirty();
                     self.reload_tree();
@@ -932,7 +1023,7 @@ impl NoteApp {
             // Which top folder is shown.
             let names: Vec<String> = self.roots.iter().map(|r| folder_name(r)).collect();
             let mut chosen = self.active;
-            egui::ComboBox::from_id_salt("top-folder")
+            let combo = egui::ComboBox::from_id_salt("top-folder")
                 .width(ui.available_width() - 8.0)
                 .selected_text(RichText::new(names.get(self.active).cloned().unwrap_or_default()).strong())
                 .show_ui(ui, |ui| {
@@ -940,12 +1031,21 @@ impl NoteApp {
                         ui.selectable_value(&mut chosen, i, n.as_str()).on_hover_text(self.roots[i].display().to_string());
                     }
                 });
+            // The shown top folder takes dropped pages and sections (it has no row of its own in
+            // the tree when it holds only sections).
+            if let Some(root) = self.roots.get(self.active).cloned() {
+                self.page_drop_target(ui, &combo.response, &root);
+                self.section_drop_target(ui, &combo.response, &root);
+            }
             if chosen != self.active {
                 self.actions.push(Action::SelectRoot(chosen));
             }
             ui.add_space(4.0);
             let Some(tree) = self.trees.get(self.active).cloned() else { return };
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // During a drag, the other notebooks get drop rows below the tree (no row above it moves).
+            let drop_notebooks = self.drop_notebooks(ui.ctx());
+            let tree_height = (ui.available_height() - Self::drop_strip_height(drop_notebooks.len())).max(40.0);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(tree_height).show(ui, |ui| {
                 for child in &tree.children {
                     self.folder_row(ui, child, 0);
                 }
@@ -954,6 +1054,7 @@ impl NoteApp {
                     self.folder_leaf(ui, &tree, 0, "(top folder)");
                 }
             });
+            self.notebook_drop_strip(ui, &drop_notebooks);
         });
     }
 
@@ -989,6 +1090,8 @@ impl NoteApp {
         let selected = self.selected_folder.as_ref() == Some(&f.path);
         let width = ui.available_width().max(60.0);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::click());
+        // Sections and section groups can be dragged; open notebooks cannot.
+        let resp = if self.roots.contains(&f.path) { resp } else { Self::section_drag_source(&resp, &f.path, name) };
         let painter = ui.painter_at(rect);
         if selected {
             painter.rect_filled(rect, CornerRadius::same(4), ACCENT_SOFT);
@@ -1011,6 +1114,7 @@ impl NoteApp {
             self.actions.push(Action::SelectFolder(f.path.clone()));
         }
         self.page_drop_target(ui, &resp, &f.path);
+        self.section_drop_target(ui, &resp, &f.path);
         let path = f.path.clone();
         let is_root = self.roots.contains(&path);
         let resp = resp.on_hover_text(name);
@@ -1033,6 +1137,10 @@ impl NoteApp {
             } else {
                 if ui.button("Rename…").clicked() {
                     self.actions.push(Action::RenameSection(path.clone()));
+                    ui.close();
+                }
+                if ui.button("Move to…").clicked() {
+                    self.actions.push(Action::ShowMoveSection(path.clone()));
                     ui.close();
                 }
                 if ui.button("Delete…").clicked() {
@@ -1586,33 +1694,21 @@ impl NoteApp {
             }
             Dialog::RenameSection { path, name } => {
                 need(name)?;
-                folder_free(path)?;
-                let new_path = store::rename_folder(path, name)?;
-                self.index.remove_tree(path);
-                self.index.add_tree(&new_path);
-                self.index_stale = true;
-                if let Some(sel) = self.selected_folder.clone()
-                    && let Ok(rest) = sel.strip_prefix(path)
-                {
-                    self.selected_folder = Some(new_path.join(rest));
-                }
-                if let Some(p) = self.page.take() {
-                    let moved = p.path.strip_prefix(path).map(|rest| new_path.join(rest)).unwrap_or(p.path.clone());
-                    self.open_page(&moved);
-                }
-                self.reload_tree();
-                self.reload_pages();
+                self.relocate_folder(path, || store::rename_folder(path, name).map(Some))?;
                 self.set_status(format!("Section renamed to \"{}\"", name.trim()));
             }
             Dialog::DeleteSection { path, name, .. } => {
                 folder_free(path)?;
-                store::delete_folder(path)?;
+                let open = self.release_open_page(|p| mover::is_within(p, path))?;
+                if let Err(e) = store::delete_folder(path) {
+                    if let Some(r) = &open {
+                        self.reopen(r, &r.path.clone());
+                    }
+                    return Err(e);
+                }
                 self.index.remove_tree(path);
                 self.index_stale = true;
-                if self.page.as_ref().is_some_and(|p| p.path.starts_with(path)) {
-                    self.page = None;
-                }
-                if self.selected_folder.as_ref().is_some_and(|s| s.starts_with(path)) {
+                if self.selected_folder.as_ref().is_some_and(|s| mover::is_within(s, path)) {
                     self.selected_folder = None;
                     self.pages.clear();
                 }

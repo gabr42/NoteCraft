@@ -85,6 +85,13 @@ page's right-click or **⋯** menu does the same with a tree of all open folders
 its subpages, its saved versions and its pictures; a picture stays in the old section as long as
 another page there (or one of its versions, or a deleted page) still uses it.
 
+To move a section, drag it in the tree onto another section (it becomes a section inside that one),
+or use **Move to…** in the section's right-click menu. While a page or a section is dragged, the
+other open notebooks are listed below the tree as drop rows, so it can also go into another
+notebook. A section moves with everything inside it: its pages, subsections, pictures and saved
+versions. If the target already has a section of that name, the moved one is named `Name (2)`.
+A section cannot be moved into itself or one of its own subsections.
+
 Folders can also be given on the command line: `NoteCraft.exe "U:\Notes" "D:\More notes"`.
 Removing a folder from the view (**Folders ▸ Remove … from view**) never touches its files.
 

@@ -152,9 +152,15 @@ fn is_md(p: &Path) -> bool {
 }
 
 /// Whether `p` is `dir` or lies below it (case-insensitive).
-fn is_within(p: &Path, dir: &Path) -> bool {
+pub(crate) fn is_within(p: &Path, dir: &Path) -> bool {
     let (p, d) = (crate::store::path_key(p), crate::store::path_key(dir));
     p.len() >= d.len() && p[..d.len()] == d[..]
+}
+
+/// `p` with its leading `from` replaced by `to` (case-insensitive), or `None` when `p` is not
+/// `from` or below it.
+pub(crate) fn rebase(p: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    is_within(p, from).then(|| to.join(p.components().skip(from.components().count()).collect::<PathBuf>()))
 }
 
 /// Whether `page` may be moved into `target_dir`: not its own folder, not its subpage folder or below.
@@ -315,6 +321,27 @@ pub fn move_page(page: &Path, target_dir: &Path) -> Result<Option<PathBuf>, Stri
     Ok(Some(new))
 }
 
+/// Whether the section `folder` may be moved into `target`: not its current parent, not itself or below it.
+pub fn can_move_section_to(folder: &Path, target: &Path) -> bool {
+    let Some(parent) = folder.parent() else { return false };
+    crate::store::path_key(parent) != crate::store::path_key(target) && !is_within(target, folder)
+}
+
+/// Moves a section folder (with its pages, pictures and history, which all live inside it) into
+/// `target`. Returns `None` when `target` is already its parent. A name clash gives `Name (2)`.
+pub fn move_section(folder: &Path, target: &Path) -> Result<Option<PathBuf>, String> {
+    let name = folder.file_name().map(|n| n.to_string_lossy().to_string()).ok_or("This folder cannot be moved.")?;
+    if is_within(target, folder) {
+        return Err("A section cannot be moved into itself.".into());
+    }
+    if folder.parent().is_none_or(|p| crate::store::path_key(p) == crate::store::path_key(target)) {
+        return Ok(None);
+    }
+    let new = target.join(free_stem(target, &name));
+    move_path(folder, &new)?;
+    Ok(Some(new))
+}
+
 /// Moves a file or folder; across drives by copying and removing the original.
 pub(crate) fn move_path(from: &Path, to: &Path) -> Result<(), String> {
     match fs::rename(from, to) {
@@ -330,6 +357,15 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn rebase_ignores_case_and_rejects_outside_paths() {
+        let (from, to) = (Path::new(r"C:\Notes\Work"), Path::new(r"D:\Other\Work (2)"));
+        assert_eq!(rebase(Path::new(r"c:\notes\WORK\a\b.md"), from, to), Some(PathBuf::from(r"D:\Other\Work (2)\a\b.md")));
+        assert_eq!(rebase(Path::new(r"C:\Notes\work"), from, to), Some(to.to_path_buf()));
+        assert_eq!(rebase(Path::new(r"C:\Notes\Workshop\a.md"), from, to), None);
+        assert_eq!(rebase(Path::new(r"C:\Notes"), from, to), None);
+    }
 
     fn temp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("notecraft-move-{}-{name}", std::process::id()));
@@ -755,6 +791,108 @@ mod tests {
         assert!(!d.join("a.md").exists());
         assert_eq!(fs::read_to_string(d.join("b.md")).unwrap(), "A");
         assert!(move_path(&d.join("missing.md"), &d.join("c.md")).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // --- sections ---
+
+    #[test]
+    fn section_to_other_section() {
+        let (d, a, b) = notebook("sec-other");
+        let p = page_with(&a, "P", "![](resources/x.png)");
+        page_with(&a.join("P"), "S", "sub");
+        pic(&a, "x.png", b"X");
+        version_of(&p, "old");
+        let new = move_section(&a, &b).unwrap().unwrap();
+        assert_eq!(new, b.join("A"));
+        assert!(new.join("P.md").is_file() && new.join("P").join("S.md").is_file());
+        assert!(new.join("resources").join("x.png").is_file());
+        assert_eq!(crate::history::list_versions(&new.join("P.md")).len(), 1);
+        assert!(!a.exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn section_to_notebook_root() {
+        let d = temp("sec-root");
+        let c = d.join("A").join("G").join("C");
+        page_with(&c, "P", "x");
+        let new = move_section(&c, &d).unwrap().unwrap();
+        assert_eq!(new, d.join("C"));
+        assert!(new.join("P.md").is_file() && !c.exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn clash_with_folder_gets_suffix() {
+        let (d, a, b) = notebook("sec-clash-folder");
+        page_with(&a, "P", "x");
+        fs::create_dir_all(b.join("A")).unwrap();
+        let new = move_section(&a, &b).unwrap().unwrap();
+        assert_eq!(new, b.join("A (2)"));
+        assert!(new.join("P.md").is_file() && b.join("A").is_dir());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn clash_with_page_gets_suffix() {
+        let (d, a, b) = notebook("sec-clash-page");
+        page_with(&a, "P", "x");
+        let other = page_with(&b, "A", "keep");
+        let new = move_section(&a, &b).unwrap().unwrap();
+        assert_eq!(new, b.join("A (2)"));
+        assert!(!b.join("A").exists());
+        assert!(fs::read_to_string(&other).unwrap().contains("keep"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn same_parent_is_noop() {
+        let (d, a, _) = notebook("sec-noop");
+        assert!(!can_move_section_to(&a, &d));
+        assert_eq!(move_section(&a, &d).unwrap(), None);
+        assert!(a.is_dir());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_parent_other_case_is_noop() {
+        let (d, a, _) = notebook("sec-noop-case");
+        let upper = PathBuf::from(d.to_string_lossy().to_uppercase());
+        assert!(!can_move_section_to(&a, &upper));
+        assert_eq!(move_section(&a, &upper).unwrap(), None);
+        assert!(a.is_dir());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn refuses_into_itself() {
+        let (d, a, _) = notebook("sec-self");
+        assert!(!can_move_section_to(&a, &a));
+        assert!(move_section(&a, &a).is_err());
+        assert!(a.is_dir());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn refuses_into_descendant() {
+        let (d, a, _) = notebook("sec-desc");
+        let sub = a.join("Sub");
+        fs::create_dir_all(&sub).unwrap();
+        assert!(!can_move_section_to(&a, &sub));
+        assert!(move_section(&a, &sub).is_err());
+        assert!(sub.is_dir() && !sub.join("A").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sibling_with_prefix_name_is_allowed() {
+        let (d, a, _) = notebook("sec-prefix");
+        let ab = d.join("AB");
+        fs::create_dir_all(&ab).unwrap();
+        assert!(can_move_section_to(&a, &ab));
+        assert_eq!(move_section(&a, &ab).unwrap().unwrap(), ab.join("A"));
         let _ = fs::remove_dir_all(&d);
     }
 }
