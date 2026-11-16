@@ -3,7 +3,9 @@
 //! Every read returns `Err` instead of panicking, whatever the input.
 
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// A GUID as stored in the file (little-endian fields, raw bytes).
 pub type Guid = [u8; 16];
@@ -360,6 +362,396 @@ impl PropState<'_, '_> {
     }
 }
 
+// --- file nodes, object spaces and revisions ---
+
+/// An object declared in an object space.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Obj {
+    pub jcid: u32,
+    pub props: PropSet,
+}
+
+/// The effective state of one object space (the head of its revisions).
+#[derive(Debug, Clone, Default)]
+pub struct Space {
+    pub objects: HashMap<ObjId, Obj>,
+    /// Embedded file declarations: object id -> (reference text, extension).
+    pub filedecl: HashMap<ObjId, (String, String)>,
+    /// Root objects by role.
+    pub roots: HashMap<u32, ObjId>,
+}
+
+/// What one revision of an object space declares.
+#[derive(Debug, Clone, Default)]
+pub struct RevData {
+    pub objects: HashMap<ObjId, Obj>,
+    pub filedecl: HashMap<ObjId, (String, String)>,
+    pub roots: HashMap<u32, ObjId>,
+    /// True when the revision has the nil context (only those are used).
+    pub ctx_nil: bool,
+}
+
+/// Last modification time of an object; `None` (older than anything) when it has none.
+fn stamp(o: &Obj) -> Option<NaiveDateTime> {
+    o.props.get_bytes(P_MOD32).and_then(time32)
+}
+
+/// Merges the revisions (in file order) into the effective state of the space.
+/// Revision order and dependencies do not tell which state is newest, so the objects' own
+/// last-modified stamps decide: per object id the copy with the latest stamp wins, and revisions
+/// are applied freshest-last so stamp-less objects follow the freshest revision.
+pub fn finalize(revs: Vec<RevData>) -> Space {
+    let mut cand: Vec<RevData> = revs.into_iter().filter(|r| r.ctx_nil).collect();
+    let mut sp = Space::default();
+    if cand.is_empty() {
+        return sp;
+    }
+    let fresh: Vec<Option<NaiveDateTime>> =
+        cand.iter().map(|r| r.objects.values().map(stamp).max().unwrap_or(None)).collect();
+    let mut idx: Vec<usize> = (0..cand.len()).collect();
+    idx.sort_by_key(|&i| fresh[i]); // stable: ties keep file order
+    let mut best: HashMap<ObjId, Obj> = HashMap::new();
+    for i in idx {
+        let r = std::mem::take(&mut cand[i]);
+        for (id, ob) in r.objects {
+            let replace = match best.get(&id) {
+                None => true,
+                Some(prev) => stamp(&ob) >= stamp(prev),
+            };
+            if replace {
+                best.insert(id, ob);
+            }
+        }
+        sp.filedecl.extend(r.filedecl);
+        // roots from the freshest revision having them
+        if !r.roots.is_empty() {
+            sp.roots = r.roots;
+        }
+    }
+    sp.objects = best;
+    sp
+}
+
+/// A parsed .one section file.
+#[derive(Debug, Default)]
+pub struct OneFile {
+    pub spaces: HashMap<ExGuid, Space>,
+    pub root_gosid: Option<ExGuid>,
+    /// Embedded file contents by lowercase GUID text without braces.
+    pub filedata: HashMap<String, Vec<u8>>,
+}
+
+const NIL64: u64 = u64::MAX;
+/// Deepest nesting of file node lists followed.
+const MAX_LIST_DEPTH: u32 = 64;
+/// Most file nodes read from one file; stops lists that reference each other in a fan-out.
+const MAX_NODES: u64 = 50_000_000;
+
+/// Global id table: index -> GUID. Shared like the Python dict: an object group start saves a
+/// reference, so entries added inside the group stay after its end unless the table was replaced.
+type Table = Rc<RefCell<HashMap<u32, Guid>>>;
+
+struct Rev {
+    dep: ExGuid,
+    table: HashMap<u32, Guid>,
+    data: RevData,
+}
+
+#[derive(Default)]
+struct SpaceBuild {
+    revs: Vec<Rev>,
+    by_id: HashMap<ExGuid, usize>,
+    /// Revision ids in file order (a repeated id refers to the latest revision with it).
+    order: Vec<ExGuid>,
+}
+
+struct Parser<'a> {
+    r: Rd<'a>,
+    spaces: HashMap<ExGuid, SpaceBuild>,
+    root_gosid: Option<ExGuid>,
+    filedata: HashMap<String, Vec<u8>>,
+    cur: Option<ExGuid>,
+    currev: Option<(ExGuid, usize)>,
+    table: Table,
+    saved_tables: Vec<Table>,
+    dep_table: HashMap<u32, Guid>,
+    /// Lists being read now, to stop reference cycles.
+    active: HashSet<(u64, u64)>,
+    nodes: u64,
+}
+
+fn us(v: u64) -> Result<usize, String> {
+    usize::try_from(v).map_err(|_| format!("offset {v} does not fit in memory"))
+}
+
+impl OneFile {
+    /// Parses the bytes of a .one file.
+    pub fn parse(data: &[u8]) -> Result<OneFile, String> {
+        let r = Rd::new(data);
+        match r.guid_at(0) {
+            Ok(g) if guid_string(&g).starts_with("7b5c52e4") => {}
+            _ => return Err("not a .one section file".to_string()),
+        }
+        let mut p = Parser {
+            r,
+            spaces: HashMap::new(),
+            root_gosid: None,
+            filedata: HashMap::new(),
+            cur: None,
+            currev: None,
+            table: Rc::new(RefCell::new(HashMap::new())),
+            saved_tables: Vec::new(),
+            dep_table: HashMap::new(),
+            active: HashSet::new(),
+            nodes: 0,
+        };
+        let stp = r.u64_at(172)?;
+        let cb = r.u32_at(180)? as u64;
+        p.read_list(stp, cb, 0)?;
+        let mut spaces = HashMap::new();
+        for (g, sb) in p.spaces {
+            // a repeated revision id refers to the same (latest) revision each time
+            let mut uses = vec![0usize; sb.revs.len()];
+            for rid in &sb.order {
+                uses[sb.by_id[rid]] += 1;
+            }
+            let mut slots: Vec<Option<RevData>> = sb.revs.into_iter().map(|r| Some(r.data)).collect();
+            let mut list = Vec::with_capacity(sb.order.len());
+            for rid in &sb.order {
+                let i = sb.by_id[rid];
+                uses[i] -= 1;
+                let d = if uses[i] == 0 { slots[i].take() } else { slots[i].clone() };
+                list.extend(d);
+            }
+            spaces.insert(g, finalize(list));
+        }
+        Ok(OneFile { spaces, root_gosid: p.root_gosid, filedata: p.filedata })
+    }
+}
+
+impl Parser<'_> {
+    fn eg(&self, pos: usize) -> Result<ExGuid, String> {
+        Ok((self.r.guid_at(pos)?, self.r.u32_at(pos + 16)?))
+    }
+
+    /// Turns a compact id into an object id through the current global id table.
+    fn cid(&self, raw: u32) -> Option<ObjId> {
+        self.table.borrow().get(&(raw >> 8)).map(|g| (*g, raw & 0xFF))
+    }
+
+    fn rev_mut(&mut self) -> Result<&mut Rev, String> {
+        let (sp, i) = self.currev.ok_or("object declared before any revision")?;
+        self.spaces.get_mut(&sp).and_then(|s| s.revs.get_mut(i)).ok_or_else(|| "lost revision".to_string())
+    }
+
+    /// The global id table the current revision's dependency ended with (empty when unknown).
+    fn dep_rev_table(&self) -> HashMap<u32, Guid> {
+        let dep = self.currev.and_then(|(sp, i)| self.spaces.get(&sp).and_then(|s| s.revs.get(i)).map(|r| r.dep));
+        let d = dep.zip(self.cur).and_then(|(dep, cur)| {
+            let s = self.spaces.get(&cur)?;
+            s.revs.get(*s.by_id.get(&dep)?)
+        });
+        d.map(|d| d.table.clone()).unwrap_or_default()
+    }
+
+    /// Reads a file node list and the lists chained behind it.
+    fn read_list(&mut self, stp: u64, cb: u64, depth: u32) -> Result<(), String> {
+        if depth > MAX_LIST_DEPTH {
+            return Err("file node lists are nested too deeply".to_string());
+        }
+        let mut chain = Vec::new();
+        let res = self.read_chain(stp, cb, depth, &mut chain);
+        for c in chain {
+            self.active.remove(&c);
+        }
+        res
+    }
+
+    fn read_chain(&mut self, mut stp: u64, mut cb: u64, depth: u32, chain: &mut Vec<(u64, u64)>) -> Result<(), String> {
+        loop {
+            if !self.active.insert((stp, cb)) {
+                return Err(format!("file node lists form a loop at offset {stp}"));
+            }
+            chain.push((stp, cb));
+            let end = stp.checked_add(cb).ok_or("file node list runs past the end of the file")?;
+            let mut pos = stp.checked_add(16).ok_or("file node list runs past the end of the file")?;
+            while pos.saturating_add(4) <= end.saturating_sub(20) {
+                let hdr = self.r.u32_at(us(pos)?)?;
+                let fid = hdr & 0x3FF;
+                let size = ((hdr >> 10) & 0x1FFF) as u64;
+                if fid == 0 || fid == 0xFF || size < 4 {
+                    break;
+                }
+                self.nodes += 1;
+                if self.nodes > MAX_NODES {
+                    return Err("too many file nodes".to_string());
+                }
+                self.node(fid, us(pos.saturating_add(4))?, (hdr >> 23) & 3, (hdr >> 25) & 3, depth)?;
+                pos = pos.saturating_add(size);
+            }
+            let tail = us(end.checked_sub(20).ok_or("file node list is too short")?)?;
+            let nstp = self.r.u64_at(tail)?;
+            let ncb = self.r.u32_at(tail + 8)? as u64;
+            if nstp == NIL64 {
+                return Ok(());
+            }
+            stp = nstp;
+            cb = ncb;
+        }
+    }
+
+    fn node(&mut self, fid: u32, pos: usize, stp_f: u32, cb_f: u32, depth: u32) -> Result<(), String> {
+        let r = self.r;
+        match fid {
+            0x04 => self.root_gosid = Some(self.eg(pos)?), // ObjectSpaceManifestRootFND
+            // ObjectSpaceManifestListReference, RevisionManifestListReference,
+            // ObjectGroupListReference, FileDataStoreListReference
+            0x08 | 0x10 | 0xB0 | 0x90 => {
+                let (s, c, _) = fcr(&r, pos, stp_f, cb_f)?;
+                self.read_list(s, c, depth + 1)?;
+            }
+            0x0C => {
+                // ObjectSpaceManifestListStartFND
+                let g = self.eg(pos)?;
+                self.spaces.entry(g).or_default();
+                self.cur = Some(g);
+            }
+            0x1B | 0x1E | 0x1F => {
+                // RevisionManifestStart4/6/7
+                let rid = self.eg(pos)?;
+                let dep = self.eg(pos + 20)?;
+                let mut ctx_nil = true;
+                if fid == 0x1F {
+                    ctx_nil = self.eg(pos + 20 + 20 + 6)?.0 == [0u8; 16];
+                }
+                let cur = self.cur.ok_or("revision outside of an object space")?;
+                let sb = self.spaces.entry(cur).or_default();
+                let rev = Rev { dep, table: HashMap::new(), data: RevData { ctx_nil, ..RevData::default() } };
+                sb.revs.push(rev);
+                let i = sb.revs.len() - 1;
+                sb.by_id.insert(rid, i);
+                sb.order.push(rid);
+                self.currev = Some((cur, i));
+                self.table = Rc::new(RefCell::new(HashMap::new()));
+                self.saved_tables.clear();
+            }
+            0x1C => {
+                // RevisionManifestEndFND
+                let t = self.table.borrow().clone();
+                if self.currev.is_some() {
+                    self.rev_mut()?.table = t;
+                }
+            }
+            0x21 => {
+                // GlobalIdTableStartFNDX
+                self.table = Rc::new(RefCell::new(HashMap::new()));
+                self.dep_table = self.dep_rev_table();
+            }
+            0x22 => {
+                // GlobalIdTableStart2FND
+                self.dep_table = self.dep_rev_table();
+                self.table = Rc::new(RefCell::new(self.dep_table.clone()));
+            }
+            0x24 => {
+                // GlobalIdTableEntryFNDX
+                let idx = r.u32_at(pos)?;
+                let g = r.guid_at(pos + 4)?;
+                self.table.borrow_mut().insert(idx, g);
+            }
+            0x25 => {
+                // GlobalIdTableEntry2FNDX
+                let a = r.u32_at(pos)?;
+                let b = r.u32_at(pos + 4)?;
+                if let Some(g) = self.dep_table.get(&a) {
+                    self.table.borrow_mut().insert(b, *g);
+                }
+            }
+            0x26 => {
+                // GlobalIdTableEntry3FNDX
+                let a = r.u32_at(pos)?;
+                let n = r.u32_at(pos + 4)?;
+                let b = r.u32_at(pos + 8)?;
+                for i in 0..n {
+                    let (Some(ai), Some(bi)) = (a.checked_add(i), b.checked_add(i)) else { break };
+                    if let Some(g) = self.dep_table.get(&ai) {
+                        self.table.borrow_mut().insert(bi, *g);
+                    }
+                }
+            }
+            0xB4 => self.saved_tables.push(self.table.clone()), // ObjectGroupStartFND
+            0xB8 => {
+                // ObjectGroupEndFND
+                if let Some(t) = self.saved_tables.pop() {
+                    self.table = t;
+                }
+            }
+            0xA4 | 0xA5 | 0xC4 | 0xC5 => {
+                // ObjectDeclaration2(Large)RefCount (ReadOnly)
+                let (s, _, p) = fcr(&r, pos, stp_f, cb_f)?;
+                let raw = r.u32_at(p)?;
+                let jcid = r.u32_at(p + 4)?;
+                r.u8_at(p + 8)?; // flags
+                let oid = self.cid(raw);
+                if let Some(oid) = oid.filter(|_| (jcid >> 17) & 1 != 0) {
+                    let table = self.table.clone();
+                    let cidf = move |raw: u32| -> Option<ObjId> {
+                        table.borrow().get(&(raw >> 8)).map(|g| (*g, raw & 0xFF))
+                    };
+                    // a damaged property set leaves the object with no properties
+                    let props = us(s).and_then(|s| read_propset(&r, s, &cidf)).unwrap_or_default();
+                    self.rev_mut()?.data.objects.insert(oid, Obj { jcid, props });
+                }
+            }
+            0x72 | 0x73 => {
+                // ObjectDeclarationFileData3(Large)RefCountFND
+                let raw = r.u32_at(pos)?;
+                r.u32_at(pos + 4)?; // jcid
+                let oid = self.cid(raw);
+                let p = pos + 8 + if fid == 0x72 { 1 } else { 4 };
+                let text = |p: usize| -> Result<(String, usize), String> {
+                    let cch = r.u32_at(p)? as usize;
+                    let start = p + 4;
+                    let end = start.saturating_add(cch.saturating_mul(2)).min(r.d.len());
+                    let b = r.d.get(start..end).unwrap_or(&[]);
+                    let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                    Ok((String::from_utf16_lossy(&units), start.saturating_add(cch.saturating_mul(2))))
+                };
+                let (rf, p) = text(p)?;
+                let (ext, _) = text(p)?;
+                if let Some(oid) = oid {
+                    self.rev_mut()?.data.filedecl.insert(oid, (rf, ext));
+                }
+            }
+            0x59 => {
+                // RootObjectReference2FNDX
+                let raw = r.u32_at(pos)?;
+                let role = r.u32_at(pos + 4)?;
+                if let Some(oid) = self.cid(raw) {
+                    self.rev_mut()?.data.roots.insert(role, oid);
+                }
+            }
+            0x5A => {
+                // RootObjectReference3FND
+                let oid = self.eg(pos)?;
+                let role = r.u32_at(pos + 20)?;
+                self.rev_mut()?.data.roots.insert(role, oid);
+            }
+            0x94 => {
+                // FileDataStoreObjectReferenceFND
+                let (s, _, p) = fcr(&r, pos, stp_f, cb_f)?;
+                let g = r.guid_at(p)?;
+                let s = us(s)?;
+                let length = r.u64_at(s.checked_add(16).ok_or("bad file data offset")?)?;
+                let start = s.saturating_add(36).min(r.d.len());
+                let end = (start as u64).saturating_add(length).min(r.d.len() as u64) as usize;
+                self.filedata.insert(guid_string(&g), r.d[start..end].to_vec());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +923,114 @@ mod tests {
         }
         assert!(read_propset(&r, 0, &cid).is_err());
         assert!(read_propset(&r, 10, &cid).is_err());
+    }
+
+    // --- file nodes, object spaces, revisions ---
+
+    fn oid(n: u8) -> ObjId {
+        ([n; 16], 0)
+    }
+
+    /// An object whose only properties are an optional `P_MOD32` stamp and a marker byte.
+    fn marked(stamp: Option<u32>, marker: u8) -> Obj {
+        let mut m = HashMap::new();
+        if let Some(s) = stamp {
+            m.insert(P_MOD32 & 0x7FFF_FFFF, PropValue::Bytes(s.to_le_bytes().to_vec()));
+        }
+        m.insert(P_PAGE_LEVEL & 0x7FFF_FFFF, PropValue::Bytes(vec![marker]));
+        Obj { jcid: J_PAGE, props: PropSet(m) }
+    }
+
+    fn marker_of(o: &Obj) -> u8 {
+        o.props.get_bytes(P_PAGE_LEVEL).unwrap()[0]
+    }
+
+    fn rev(objs: Vec<(ObjId, Obj)>, roots: Vec<(u32, ObjId)>, ctx_nil: bool) -> RevData {
+        RevData { objects: objs.into_iter().collect(), filedecl: HashMap::new(), roots: roots.into_iter().collect(), ctx_nil }
+    }
+
+    #[test]
+    fn finalize_latest_stamp_wins() {
+        let a = rev(vec![(oid(1), marked(Some(200), 1)), (oid(9), marked(None, 10))], vec![(1, oid(1))], true);
+        let b = rev(vec![(oid(1), marked(Some(100), 2)), (oid(9), marked(None, 20))], vec![(1, oid(2))], true);
+        let sp = finalize(vec![a, b]);
+        assert_eq!(marker_of(&sp.objects[&oid(1)]), 1);
+        assert_eq!(marker_of(&sp.objects[&oid(9)]), 10);
+        assert_eq!(sp.roots[&1], oid(1));
+    }
+
+    #[test]
+    fn finalize_ties_keep_file_order() {
+        let a = rev(vec![(oid(1), marked(Some(100), 1))], vec![(1, oid(1))], true);
+        let b = rev(vec![(oid(1), marked(Some(100), 2))], vec![(1, oid(2))], true);
+        let sp = finalize(vec![a, b]);
+        assert_eq!(marker_of(&sp.objects[&oid(1)]), 2);
+        assert_eq!(sp.roots[&1], oid(2));
+    }
+
+    #[test]
+    fn finalize_ignores_non_nil_context() {
+        let a = rev(vec![(oid(1), marked(Some(300), 1))], vec![(1, oid(1))], false);
+        let b = rev(vec![(oid(1), marked(Some(100), 2))], vec![(1, oid(2))], true);
+        let sp = finalize(vec![a, b]);
+        assert_eq!(marker_of(&sp.objects[&oid(1)]), 2);
+        assert_eq!(sp.roots[&1], oid(2));
+        let only = finalize(vec![rev(vec![(oid(1), marked(Some(1), 1))], vec![], false)]);
+        assert!(only.objects.is_empty() && only.roots.is_empty());
+    }
+
+    fn header() -> Vec<u8> {
+        let mut h = vec![0xE4, 0x52, 0x5C, 0x7B];
+        h.extend([0u8; 12]);
+        h
+    }
+
+    #[test]
+    fn garbage_is_an_error_not_a_panic() {
+        assert!(OneFile::parse(&[]).is_err());
+        assert_eq!(OneFile::parse(&[0u8; 200]).err().unwrap(), "not a .one section file");
+        let mut d = header();
+        d.extend([0xFFu8; 300]);
+        assert!(OneFile::parse(&d).is_err());
+        let mut x: u32 = 12345;
+        let buf: Vec<u8> = (0..600)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect();
+        for n in 0..=buf.len() {
+            let _ = OneFile::parse(&buf[..n]);
+            // the same bytes behind a valid header exercise the node walker
+            let mut d = header();
+            d.extend(&buf[..n]);
+            let _ = OneFile::parse(&d);
+        }
+    }
+
+    #[test]
+    fn node_list_cycle_is_an_error() {
+        // header, then a list at 184 whose "next" pointer points to itself
+        let mut d = header();
+        d.resize(172, 0);
+        d.extend(184u64.to_le_bytes());
+        d.extend(100u32.to_le_bytes()); // list 184..284
+        d.resize(184, 0);
+        d.resize(284, 0);
+        d[264..272].copy_from_slice(&184u64.to_le_bytes());
+        d[272..276].copy_from_slice(&100u32.to_le_bytes());
+        assert!(OneFile::parse(&d).is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn real_sample() {
+        let path = std::env::var("ONENOTE_SAMPLE").expect("set ONENOTE_SAMPLE to a .one file");
+        let data = std::fs::read(&path).unwrap();
+        let f = OneFile::parse(&data).unwrap();
+        let g = f.root_gosid.expect("root_gosid");
+        let sp = f.spaces.get(&g).expect("root space");
+        assert!(sp.roots.contains_key(&1), "root space has no role 1 root");
+        eprintln!("{path}: {} spaces, {} file data, root objects {}", f.spaces.len(), f.filedata.len(), sp.objects.len());
     }
 }
