@@ -330,7 +330,7 @@ impl NoteApp {
         self.pages.clear();
         self.start_indexing();
 
-        let wanted = want_page.filter(|p| p.is_file() && self.roots.iter().any(|r| p.starts_with(r))).map(|p| p.to_path_buf());
+        let wanted = want_page.filter(|p| p.is_file() && self.roots.iter().any(|r| store::is_within(p, r))).map(|p| p.to_path_buf());
         if let Some(p) = wanted {
             let dir = self.folder_of_page(&p);
             self.select_folder(dir, false);
@@ -365,11 +365,11 @@ impl NoteApp {
             self.active -= 1;
         }
         self.active = self.active.min(self.roots.len().saturating_sub(1));
-        if self.selected_folder.as_ref().is_some_and(|s| s.starts_with(dir)) {
+        if self.selected_folder.as_ref().is_some_and(|s| store::is_within(s, dir)) {
             self.selected_folder = None;
             self.pages.clear();
         }
-        if self.page.as_ref().is_some_and(|p| p.path.starts_with(dir)) {
+        if self.page.as_ref().is_some_and(|p| store::is_within(&p.path, dir)) {
             self.page = None;
             self.lock = None;
             self.mode = Mode::View;
@@ -405,7 +405,7 @@ impl NoteApp {
 
     /// Shows the top folder that holds `dir` in the left column.
     fn show_root_of(&mut self, dir: &Path) {
-        if let Some(i) = self.roots.iter().position(|r| dir.starts_with(r)) {
+        if let Some(i) = self.roots.iter().position(|r| store::is_within(dir, r)) {
             self.active = i;
         }
     }
@@ -572,7 +572,7 @@ impl NoteApp {
         op: impl FnOnce() -> Result<Option<PathBuf>, String>,
     ) -> Result<Option<PathBuf>, String> {
         folder_free(folder)?;
-        let open = self.release_open_page(|p| mover::is_within(p, folder))?;
+        let open = self.release_open_page(|p| store::is_within(p, folder))?;
         let new = match op() {
             Ok(Some(new)) => new,
             other => {
@@ -586,7 +586,7 @@ impl NoteApp {
         self.index.add_tree(&new);
         self.index_stale = true;
         if let Some(sel) = self.selected_folder.clone()
-            && let Some(moved) = mover::rebase(&sel, folder, &new)
+            && let Some(moved) = store::rebase(&sel, folder, &new)
         {
             self.selected_folder = Some(moved);
             // The selection follows the folder, also into another notebook.
@@ -595,7 +595,7 @@ impl NoteApp {
         self.reload_tree();
         self.reload_pages();
         if let Some(r) = open {
-            let moved = mover::rebase(&r.path, folder, &new).unwrap_or(r.path.clone());
+            let moved = store::rebase(&r.path, folder, &new).unwrap_or(r.path.clone());
             self.reopen(&r, &moved);
         }
         Ok(Some(new))
@@ -1064,7 +1064,7 @@ impl NoteApp {
             return;
         }
         let id = Id::unique(("folder", &f.path));
-        let on_path = self.selected_folder.as_ref().is_some_and(|s| s.starts_with(&f.path) && s != &f.path);
+        let on_path = self.selected_folder.as_ref().is_some_and(|s| store::is_within(s, &f.path) && !store::same_path(s, &f.path));
         let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, depth < 2 || on_path);
         if on_path && !state.is_open() && self.frames < 3 {
             state.set_open(true);
@@ -1671,7 +1671,7 @@ impl NoteApp {
                 self.index.remove(path);
                 self.index.remove_tree(&store::subpage_dir(path));
                 self.index_stale = true;
-                let was_open = self.page.as_ref().is_some_and(|p| p.path.starts_with(store::subpage_dir(path)) || &p.path == path);
+                let was_open = self.page.as_ref().is_some_and(|p| store::is_within(&p.path, &store::subpage_dir(path)) || store::same_path(&p.path, path));
                 if was_open {
                     self.page = None;
                 }
@@ -1699,7 +1699,7 @@ impl NoteApp {
             }
             Dialog::DeleteSection { path, name, .. } => {
                 folder_free(path)?;
-                let open = self.release_open_page(|p| mover::is_within(p, path))?;
+                let open = self.release_open_page(|p| store::is_within(p, path))?;
                 if let Err(e) = store::delete_folder(path) {
                     if let Some(r) = &open {
                         self.reopen(r, &r.path.clone());
@@ -1708,7 +1708,7 @@ impl NoteApp {
                 }
                 self.index.remove_tree(path);
                 self.index_stale = true;
-                if self.selected_folder.as_ref().is_some_and(|s| mover::is_within(s, path)) {
+                if self.selected_folder.as_ref().is_some_and(|s| store::is_within(s, path)) {
                     self.selected_folder = None;
                     self.pages.clear();
                 }

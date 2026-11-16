@@ -501,6 +501,31 @@ pub(crate) fn path_key(p: &Path) -> Vec<String> {
     p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect()
 }
 
+/// Whether two paths name the same file or folder (case-insensitive).
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
+    path_key(a) == path_key(b)
+}
+
+/// Whether `p` is `dir` or lies below it (case-insensitive).
+pub(crate) fn is_within(p: &Path, dir: &Path) -> bool {
+    let (p, d) = (path_key(p), path_key(dir));
+    p.len() >= d.len() && p[..d.len()] == d[..]
+}
+
+/// `p` with its leading `from` replaced by `to` (case-insensitive), or `None` when `p` is not
+/// `from` or below it.
+pub(crate) fn rebase(p: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    is_within(p, from).then(|| to.join(p.components().skip(from.components().count()).collect::<PathBuf>()))
+}
+
+/// "Top-level folder › Section › ..." for `folder`, which lies in one of `roots`; empty otherwise.
+pub(crate) fn place_in(roots: &[PathBuf], folder: &Path) -> String {
+    let Some(root) = roots.iter().find(|r| is_within(folder, r)) else { return String::new() };
+    // Keep the root's own name in front: skip only the components of its parent.
+    let skip = root.parent().map_or(root.components().count(), |b| b.components().count());
+    folder.components().skip(skip).map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join(" › ")
+}
+
 /// Whether a new top-level folder may be added to the open ones: it must not be one of them,
 /// lie inside one of them, or contain one of them.
 pub fn check_new_root(existing: &[PathBuf], new: &Path) -> Result<(), String> {
@@ -617,12 +642,12 @@ impl Index {
     }
 
     pub fn remove(&mut self, path: &Path) {
-        self.pages.retain(|p| p.path != path);
+        self.pages.retain(|p| !same_path(&p.path, path));
     }
 
     /// Removes everything at or below `path` (a deleted or renamed folder).
     pub fn remove_tree(&mut self, path: &Path) {
-        self.pages.retain(|p| !p.path.starts_with(path));
+        self.pages.retain(|p| !is_within(&p.path, path));
     }
 
     pub fn add_tree(&mut self, path: &Path) {
@@ -634,12 +659,7 @@ impl Index {
 
     /// "Top-level folder › Section › ..." for a page.
     pub(crate) fn place_of(&self, path: &Path) -> String {
-        let dir = path.parent().unwrap_or(Path::new(""));
-        let root = self.roots.iter().find(|r| dir.starts_with(r));
-        // Strip the parent of the root, so the root's own name stays in front.
-        let base = root.map(|r| r.parent().unwrap_or(r.as_path()));
-        let rel = base.and_then(|b| dir.strip_prefix(b).ok()).map(|p| p.to_path_buf()).unwrap_or_default();
-        rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join(" › ")
+        place_in(&self.roots, path.parent().unwrap_or(Path::new("")))
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
@@ -738,6 +758,23 @@ fn make_snippet(text: &[char], pos: usize, len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebase_ignores_case_and_rejects_outside_paths() {
+        let (from, to) = (Path::new(r"C:\Notes\Work"), Path::new(r"D:\Other\Work (2)"));
+        assert_eq!(rebase(Path::new(r"c:\notes\WORK\a\b.md"), from, to), Some(PathBuf::from(r"D:\Other\Work (2)\a\b.md")));
+        assert_eq!(rebase(Path::new(r"C:\Notes\work"), from, to), Some(to.to_path_buf()));
+        assert_eq!(rebase(Path::new(r"C:\Notes\Workshop\a.md"), from, to), None);
+        assert_eq!(rebase(Path::new(r"C:\Notes"), from, to), None);
+    }
+
+    #[test]
+    fn place_in_starts_with_the_root_name_and_ignores_case() {
+        let roots = vec![PathBuf::from(r"C:\Data\Notes")];
+        assert_eq!(place_in(&roots, Path::new(r"c:\data\notes\Work\Plans")), "notes › Work › Plans");
+        assert_eq!(place_in(&roots, Path::new(r"C:\Data\Notes")), "Notes");
+        assert_eq!(place_in(&roots, Path::new(r"C:\Elsewhere")), "");
+    }
 
     #[test]
     fn front_matter_round_trip() {

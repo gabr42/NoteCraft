@@ -151,17 +151,7 @@ fn is_md(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("md"))
 }
 
-/// Whether `p` is `dir` or lies below it (case-insensitive).
-pub(crate) fn is_within(p: &Path, dir: &Path) -> bool {
-    let (p, d) = (crate::store::path_key(p), crate::store::path_key(dir));
-    p.len() >= d.len() && p[..d.len()] == d[..]
-}
-
-/// `p` with its leading `from` replaced by `to` (case-insensitive), or `None` when `p` is not
-/// `from` or below it.
-pub(crate) fn rebase(p: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
-    is_within(p, from).then(|| to.join(p.components().skip(from.components().count()).collect::<PathBuf>()))
-}
+use crate::store::is_within;
 
 /// Whether `page` may be moved into `target_dir`: not its own folder, not its subpage folder or below.
 pub fn can_move_to(page: &Path, target_dir: &Path) -> bool {
@@ -357,15 +347,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-
-    #[test]
-    fn rebase_ignores_case_and_rejects_outside_paths() {
-        let (from, to) = (Path::new(r"C:\Notes\Work"), Path::new(r"D:\Other\Work (2)"));
-        assert_eq!(rebase(Path::new(r"c:\notes\WORK\a\b.md"), from, to), Some(PathBuf::from(r"D:\Other\Work (2)\a\b.md")));
-        assert_eq!(rebase(Path::new(r"C:\Notes\work"), from, to), Some(to.to_path_buf()));
-        assert_eq!(rebase(Path::new(r"C:\Notes\Workshop\a.md"), from, to), None);
-        assert_eq!(rebase(Path::new(r"C:\Notes"), from, to), None);
-    }
 
     fn temp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("notecraft-move-{}-{name}", std::process::id()));

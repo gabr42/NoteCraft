@@ -187,8 +187,7 @@ impl NoteApp {
         page_free(page)?;
         let sub = store::subpage_dir(page);
         // The open page, when it moves along (the page itself or one of its subpages).
-        let same = |p: &Path| store::path_key(p) == store::path_key(page);
-        let open = self.release_open_page(|p| same(p) || mover::is_within(p, &sub))?;
+        let open = self.release_open_page(|p| store::same_path(p, page) || store::is_within(p, &sub))?;
         let title = store::read_doc(page).map(|d| d.title_or(page)).unwrap_or_else(|_| store::file_stem(page));
         let new = match mover::move_page(page, target_dir) {
             Ok(Some(new)) => new,
@@ -207,7 +206,7 @@ impl NoteApp {
         self.reload_tree();
         self.reload_pages();
         if let Some(r) = &open {
-            let reopened = mover::rebase(&r.path, &sub, &store::subpage_dir(&new)).unwrap_or_else(|| new.clone());
+            let reopened = store::rebase(&r.path, &sub, &store::subpage_dir(&new)).unwrap_or_else(|| new.clone());
             self.reopen(r, &reopened);
         }
         self.set_status(format!("Moved \"{title}\" to {}", self.index.place_of(&new)));
@@ -229,7 +228,7 @@ impl NoteApp {
 
     fn move_folder_rows(&self, ui: &mut egui::Ui, win: &mut MoveDialog, f: &Folder, depth: usize) {
         let id = Id::unique(("move-folder", win.salt, &f.path));
-        let open_default = win.home.starts_with(&f.path);
+        let open_default = store::is_within(&win.home, &f.path);
         let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, open_default);
         let is_open = state.is_open();
         state

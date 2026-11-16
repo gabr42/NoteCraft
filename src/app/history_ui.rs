@@ -423,7 +423,7 @@ impl NoteApp {
                                 let kind = if item.kind == history::ItemKind::Page { "page" } else { "section" };
                                 let info = format!(
                                     "{kind} from {}  ·  deleted {}",
-                                    history::place_of(&roots, &item.original_folder),
+                                    store::place_in(&roots, &item.original_folder),
                                     when_text(item.deleted_at)
                                 );
                                 let resp = ui.push_id(i, |ui| search_row(ui, &item.name, &info, "", 1, win.selected == Some(i))).inner;
