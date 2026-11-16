@@ -1007,6 +1007,7 @@ impl NoteApp {
         if resp.clicked() {
             self.actions.push(Action::SelectFolder(f.path.clone()));
         }
+        self.page_drop_target(ui, &resp, &f.path);
         let path = f.path.clone();
         let is_root = self.roots.contains(&path);
         let resp = resp.on_hover_text(name);
@@ -1110,9 +1111,11 @@ impl NoteApp {
                 let indent = 14.0 * pg.level as f32;
                 let date = if pg.created.len() >= 10 { pg.created[..10].to_string() } else { String::new() };
                 let resp = list_row(ui, &pg.title, &date, selected, indent, 40.0);
+                let resp = Self::page_drag_source(&resp, &pg.path, &pg.title);
                 if resp.clicked() {
                     self.actions.push(Action::OpenPage(pg.path.clone()));
                 }
+                self.page_drop_target(ui, &resp, &store::subpage_dir(&pg.path));
                 self.page_context_menu(&resp, &pg.path);
             }
         });
@@ -2003,6 +2006,7 @@ impl eframe::App for NoteApp {
         self.deleted_window(&ctx);
         self.history_view_window(&ctx);
         self.move_window(&ctx);
+        self.drag_label(&ctx);
         self.import_window(&ctx);
         if self.import_win.as_ref().is_some_and(|w| w.exit_ready()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

@@ -19,7 +19,44 @@ pub struct MoveDialog {
     message: String,
 }
 
+/// What is carried while a page is dragged: its path and title.
+pub struct DragPage(pub PathBuf, pub String);
+
 impl NoteApp {
+    /// Lets a page row be dragged.
+    pub(super) fn page_drag_source(resp: &egui::Response, page: &Path, title: &str) -> egui::Response {
+        let resp = resp.interact(Sense::click_and_drag());
+        resp.dnd_set_drag_payload(DragPage(page.to_path_buf(), title.to_string()));
+        resp
+    }
+
+    /// Highlights a row a dragged page may be dropped on, and turns the drop into a move.
+    pub(super) fn page_drop_target(&mut self, ui: &egui::Ui, resp: &egui::Response, target_dir: &Path) {
+        let Some(p) = resp.dnd_hover_payload::<DragPage>() else { return };
+        if !mover::can_move_to(&p.0, target_dir) {
+            return;
+        }
+        ui.painter().rect_stroke(resp.rect, CornerRadius::same(4), Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+        if let Some(p) = resp.dnd_release_payload::<DragPage>() {
+            self.actions.push(Action::MovePage { page: p.0.clone(), target_dir: target_dir.to_path_buf() });
+        }
+    }
+
+    /// The title of the dragged page next to the pointer.
+    pub(super) fn drag_label(&self, ctx: &egui::Context) {
+        let Some(p) = egui::DragAndDrop::payload::<DragPage>(ctx) else { return };
+        let Some(pos) = ctx.pointer_latest_pos() else { return };
+        egui::Area::new(Id::unique("drag-page"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(pos + Vec2::new(14.0, 10.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(RichText::new(&p.1).color(TEXT));
+                });
+            });
+    }
+
     pub(super) fn open_move(&mut self, page: PathBuf) {
         let title = store::read_doc(&page).map(|d| d.title_or(&page)).unwrap_or_else(|_| store::file_stem(&page));
         let home = self.folder_of_page(&page);
