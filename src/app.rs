@@ -582,8 +582,8 @@ impl NoteApp {
                 return other;
             }
         };
-        self.index.remove_tree(folder);
-        self.index.add_tree(&new);
+        // Moving or renaming a folder changes no page text: no need to read the files again.
+        self.index.relocate(folder, &new);
         self.index_stale = true;
         if let Some(sel) = self.selected_folder.clone()
             && let Some(moved) = store::rebase(&sel, folder, &new)
@@ -1650,9 +1650,8 @@ impl NoteApp {
                 need(title)?;
                 page_free(path)?;
                 let new_path = store::rename_page(path, title)?;
-                self.index.remove_tree(&store::subpage_dir(path));
+                self.index.relocate(&store::subpage_dir(path), &store::subpage_dir(&new_path));
                 self.index.remove(path);
-                self.index.add_tree(&store::subpage_dir(&new_path));
                 self.index.add(&new_path);
                 self.index_stale = true;
                 let was_open = self.page.as_ref().is_some_and(|p| &p.path == path);

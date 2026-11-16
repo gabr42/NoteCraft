@@ -198,10 +198,11 @@ impl NoteApp {
                 return other.map(|_| ());
             }
         };
+        // The page itself is read again (a name clash renames it, which can change its title);
+        // its subpages only change place.
         self.index.remove(page);
-        self.index.remove_tree(&sub);
         self.index.add(&new);
-        self.index.add_tree(&store::subpage_dir(&new));
+        self.index.relocate(&sub, &store::subpage_dir(&new));
         self.index_stale = true;
         self.reload_tree();
         self.reload_pages();

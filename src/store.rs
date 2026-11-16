@@ -650,10 +650,24 @@ impl Index {
         self.pages.retain(|p| !is_within(&p.path, path));
     }
 
+    /// Indexes every page at or below `path` (replacing what was indexed there); reads each file once.
     pub fn add_tree(&mut self, path: &Path) {
-        let sub = Index::build(&[path.to_path_buf()]);
-        for p in sub.pages {
-            self.add(&p.path);
+        self.remove_tree(path);
+        for mut p in Index::build(&[path.to_path_buf()]).pages {
+            p.place = self.place_of(&p.path);
+            self.pages.push(p);
+        }
+    }
+
+    /// Follows a file or folder that was moved or renamed from `from` to `to` without reading any
+    /// file: the pages at or below `from` get their new path and place. Titles stay as they were.
+    pub fn relocate(&mut self, from: &Path, to: &Path) {
+        let roots = &self.roots;
+        for p in &mut self.pages {
+            if let Some(new) = rebase(&p.path, from, to) {
+                p.place = place_in(roots, new.parent().unwrap_or(Path::new("")));
+                p.path = new;
+            }
         }
     }
 
@@ -934,7 +948,26 @@ mod tests {
         let late = create_page(&soups, "Late goulash").unwrap();
         idx.add(&late);
         assert!(idx.search("late", 10).iter().any(|h| h.place == "A › Soups"));
+
+        // A section moved to the other folder: the index follows without reading the files.
+        let moved = b.join("Soups");
+        fs::rename(&soups, &moved).unwrap();
+        idx.relocate(&soups, &moved);
+        let hits = idx.search("goulash", 10);
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|h| store_place_ok(h, &b)), "{:?}", hits.iter().map(|h| (&h.path, &h.place)).collect::<Vec<_>>());
+
+        // add_tree replaces what was there and gives each page its place in the open folders.
+        create_page(&moved, "Fresh goulash").unwrap();
+        idx.add_tree(&moved);
+        assert_eq!(idx.pages.len(), 5);
+        assert!(idx.search("fresh", 10).iter().any(|h| h.place == "B › Soups"));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A goulash hit after the move: the trout in B › Fish, the soups now in B › Soups.
+    fn store_place_ok(h: &SearchHit, b: &Path) -> bool {
+        is_within(&h.path, b) && h.path.is_file() && (h.place == "B › Soups" || h.place == "B › Fish")
     }
 
     #[test]
