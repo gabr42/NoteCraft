@@ -281,7 +281,13 @@ impl<'a> Converter<'a> {
                 186 => encoding_rs::WINDOWS_1257,
                 _ => encoding_rs::WINDOWS_1252,
             };
-            enc.decode_without_bom_handling(raw).0.into_owned()
+            // These code pages map every defined byte outside 0x80..0x9F's C1 range, so a C1
+            // character marks an undefined byte; show it as U+FFFD, as Python's 'replace' does.
+            enc.decode_without_bom_handling(raw)
+                .0
+                .chars()
+                .map(|c| if ('\u{80}'..='\u{9F}').contains(&c) { '\u{FFFD}' } else { c })
+                .collect()
         } else {
             return String::new();
         };
@@ -1266,6 +1272,24 @@ mod tests {
     }
 
     #[test]
+    fn undefined_code_page_byte_is_replacement_char() {
+        let mut ts = TSpace::default();
+        // 0x81 is undefined in cp1250 and cp1252; 0x8A is defined (S-caron)
+        let a = ts.add(
+            J_RICHTEXT,
+            vec![(P_TEXT_ASCII, PropValue::Bytes(vec![0x81, 0x8A])), (P_CHARSET, PropValue::Bytes(vec![238]))],
+        );
+        let b = ts.add(J_RICHTEXT, vec![(P_TEXT_ASCII, PropValue::Bytes(vec![0x81, b'x']))]);
+        let one = one_with(ts.sp);
+        let mut cb = |_: &[u8], _: &str| String::new();
+        let mut c = Converter::new(&one, &mut cb);
+        let sp = &one.spaces[&one.root_gosid.unwrap()];
+        c.sp = Some(sp);
+        assert_eq!(c.render_rich(&sp.objects[&a]), "\u{FFFD}\u{160}");
+        assert_eq!(c.render_rich(&sp.objects[&b]), "\u{FFFD}x");
+    }
+
+    #[test]
     fn limit_warnings_once_per_page() {
         // a chain of OEs nested deeper than MAX_NEST, two branches at every level
         let one = section_with_page(
@@ -1305,37 +1329,5 @@ mod tests {
         let (_, w, _) = run_converter(&one);
         assert_eq!(w.iter().filter(|x| x.contains("too many elements")).count(), 1, "{w:?}");
         assert_eq!(w.iter().filter(|x| x.contains("nested too deeply")).count(), 0, "{w:?}");
-    }
-
-    /// Converts the section in `ONENOTE_SAMPLE` and writes a plain dump to `ONENOTE_DUMP` (read-only on the source).
-    #[test]
-    #[ignore]
-    fn real_sample_dump() {
-        use md5::{Digest, Md5};
-        let path = std::env::var("ONENOTE_SAMPLE").expect("set ONENOTE_SAMPLE to a .one file");
-        let dump = std::env::var("ONENOTE_DUMP").expect("set ONENOTE_DUMP to an output file");
-        let one = OneFile::parse(&std::fs::read(&path).unwrap()).unwrap();
-        let mut cb = |d: &[u8], ext: &str| format!("{:x}{ext}", Md5::digest(d));
-        let mut c = Converter::new(&one, &mut cb);
-        let pages = c.section_pages().unwrap();
-        let mut out = String::new();
-        for p in &pages {
-            let f = |t: Option<NaiveDateTime>| t.map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string()).unwrap_or_default();
-            out.push_str(&format!("### {} | {} | {} | {}\n", p.title, p.level, f(p.created), f(p.updated)));
-            for (i, b) in p.blocks.iter().enumerate() {
-                if i > 0 {
-                    out.push_str("---\n");
-                }
-                out.push_str(&b.join("\n"));
-                out.push('\n');
-            }
-        }
-        std::fs::write(&dump, out).unwrap();
-        eprintln!("{} pages, {} warnings: {:?}", pages.len(), c.warnings.len(), &c.warnings[..c.warnings.len().min(5)]);
-        for p in pages.iter().take(5) {
-            eprintln!("{:?} level {} blocks {}", p.title, p.level, p.blocks.len());
-        }
-        let md = pages.iter().map(page_markdown).collect::<Vec<_>>();
-        eprintln!("first markdown:\n{}", md.first().map(|s| &s[..s.len().min(400)]).unwrap_or(""));
     }
 }

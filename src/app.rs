@@ -1962,8 +1962,10 @@ impl eframe::App for NoteApp {
             self.save_if_dirty();
             self.lock = None;
             self.remember();
-            if let Some(w) = &mut self.import_win {
-                w.stop_before_exit();
+            // A running import is asked to stop; the window stays until it has (see `exit_ready`).
+            if self.import_win.as_mut().is_some_and(|w| w.hold_exit()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.set_status("Stopping the import before closing…".to_string());
             }
         }
 
@@ -1979,6 +1981,9 @@ impl eframe::App for NoteApp {
         self.deleted_window(&ctx);
         self.history_view_window(&ctx);
         self.import_window(&ctx);
+        if self.import_win.as_ref().is_some_and(|w| w.exit_ready()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         self.history_search_tick(&ctx);
         self.apply_actions();
         self.sync_web(frame, &ctx);

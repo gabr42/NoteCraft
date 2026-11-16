@@ -74,8 +74,8 @@ fn is_section_file(name: &str) -> bool {
     name.len() > 4 && name.get(name.len() - 4..).is_some_and(|e| e.eq_ignore_ascii_case(".one"))
 }
 
-/// The `.one` files below `src`: per folder first its own files (sorted), then the subfolders in
-/// sorted order, like `os.walk` + `sorted`; `OneNote_RecycleBin` is skipped.
+/// The `.one` files below `src`: per folder first its own files, then the subfolders, both sorted
+/// without regard to case (as Explorer lists them); `OneNote_RecycleBin` is skipped.
 pub fn find_sections(src: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     walk(src, &mut out);
@@ -97,8 +97,11 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             files.push((name, e.path()));
         }
     }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    dirs.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()).then_with(|| a.0.cmp(&b.0)));
+    let by_name = |a: &(String, PathBuf), b: &(String, PathBuf)| {
+        a.0.to_lowercase().cmp(&b.0.to_lowercase()).then_with(|| a.0.cmp(&b.0))
+    };
+    files.sort_by(by_name);
+    dirs.sort_by(by_name);
     out.extend(files.into_iter().map(|f| f.1));
     for (_, d) in dirs {
         walk(&d, out);
@@ -202,13 +205,25 @@ pub fn write_section(dir: &Path, pages: &[(String, String)], report: &mut Report
                 continue;
             }
         }
-        match std::fs::write(&path, md.as_bytes()) {
+        match write_replacing(&path, md.as_bytes()) {
             Ok(()) if exists => report.pages_replaced += 1,
             Ok(()) => report.pages_written += 1,
             Err(e) => report.problems.push(format!("{}: could not write the page: {e}", path.display())),
         }
     }
     true
+}
+
+/// Writes `path` through a temporary file next to it, so a failed write leaves the old page whole.
+fn write_replacing(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".import-tmp");
+    let tmp = PathBuf::from(tmp);
+    let result = std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Only `.` and ASCII letters and digits, at most 10 characters after the dot; empty when nothing
@@ -388,6 +403,22 @@ mod tests {
     }
 
     #[test]
+    fn replace_leaves_no_temporary_file() {
+        let d = temp("tmpfile");
+        fs::write(d.join("A.md"), "old").unwrap();
+        let mut r = Report::default();
+        write_section(&d, &pages(&[("A", "new"), ("B", "two")]), &mut r);
+        let names: Vec<String> = fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().unwrap().is_file())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(names.iter().all(|n| !n.ends_with(".import-tmp")), "{names:?}");
+        assert_eq!(fs::read_to_string(d.join("A.md")).unwrap(), "new");
+    }
+
+    #[test]
     fn replace_with_no_version_makes_one() {
         let d = temp("replace1");
         let page = d.join("A.md");
@@ -540,13 +571,16 @@ mod tests {
     #[test]
     fn sections_found_sorted() {
         let d = temp("find");
-        for f in ["b.one", "A.one", "t.onetoc2", "g/c.one", "OneNote_RecycleBin/x.one"] {
+        for f in ["b.one", "C.one", "A.one", "t.onetoc2", "g/c.one", "OneNote_RecycleBin/x.one"] {
             let p = d.join(f);
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(p, b"x").unwrap();
         }
         let found: Vec<PathBuf> = find_sections(&d).iter().map(|p| p.strip_prefix(&d).unwrap().to_path_buf()).collect();
-        assert_eq!(found, vec![PathBuf::from("A.one"), PathBuf::from("b.one"), PathBuf::from("g").join("c.one")]);
+        assert_eq!(
+            found,
+            vec![PathBuf::from("A.one"), PathBuf::from("b.one"), PathBuf::from("C.one"), PathBuf::from("g").join("c.one")]
+        );
     }
 
     #[test]

@@ -36,6 +36,12 @@ pub struct ImportWin {
     checked_for: Option<(String, String)>,
     /// The notebook folder the import writes, or why Next is disabled.
     target: Result<PathBuf, String>,
+    /// The notebook folder in `target` exists and holds anything (so the user is asked first).
+    target_not_empty: bool,
+    /// The count running on its own thread, for this source text.
+    counting: Option<(String, mpsc::Receiver<Result<(usize, usize), String>>)>,
+    /// The target check running on its own thread, for this (source, target) text.
+    checking: Option<((String, String), mpsc::Receiver<Result<(PathBuf, bool), String>>)>,
     /// The question about a non-empty notebook folder is showing.
     confirm: bool,
     /// The notebook folder the user already agreed to write into (asked once per wizard).
@@ -47,6 +53,8 @@ pub struct ImportWin {
     last: Option<(usize, usize, String)>,
     report: Option<Report>,
     message: String,
+    /// NoteCraft is closing and waits for the import until this moment.
+    exit_deadline: Option<Instant>,
 }
 
 impl ImportWin {
@@ -60,6 +68,9 @@ impl ImportWin {
             found: Err(String::new()),
             checked_for: None,
             target: Err(String::new()),
+            target_not_empty: false,
+            counting: None,
+            checking: None,
             confirm: false,
             confirmed_for: None,
             rx: None,
@@ -67,6 +78,7 @@ impl ImportWin {
             last: None,
             report: None,
             message: String::new(),
+            exit_deadline: None,
         }
     }
 
@@ -82,12 +94,21 @@ impl ImportWin {
         self.rx.is_some()
     }
 
-    /// Counts the sections of the source when its text has changed and typing has paused.
+    /// Counts the sections of the source, on its own thread, when its text has changed and typing
+    /// has paused; takes the result when it is there.
     fn refresh_count(&mut self, ctx: &egui::Context) {
+        if let Some((key, rx)) = &self.counting
+            && let Some(found) = background_result(rx)
+        {
+            self.found = found.unwrap_or_else(|| Err("Could not read this folder.".into()));
+            self.counted_for = Some(key.clone());
+            self.counting = None;
+        }
         let waited = self.changed_at.map(|t| t.elapsed());
-        if recount_due(self.counted_for.as_deref(), &self.src, waited) {
-            self.found = count_sections(&self.src);
-            self.counted_for = Some(self.src.clone());
+        let pending = self.counting.as_ref().is_some_and(|c| c.0 == self.src);
+        if !pending && recount_due(self.counted_for.as_deref(), &self.src, waited) {
+            let text = self.src.clone();
+            self.counting = Some((self.src.clone(), in_background(ctx, move || count_sections(&text))));
             self.changed_at = None;
         } else if self.counted_for.as_deref() != Some(self.src.as_str())
             && let Some(w) = waited
@@ -96,13 +117,35 @@ impl ImportWin {
         }
     }
 
-    /// Checks the target when the source or target text has changed.
-    fn refresh_target(&mut self) {
-        let key = (self.src.clone(), self.dst.clone());
-        if self.checked_for.as_ref() != Some(&key) {
-            self.target = target_check(&self.src_path(), &self.dst);
-            self.checked_for = Some(key);
+    /// Checks the target, on its own thread, when the source or target text has changed; takes
+    /// the result when it is there.
+    fn refresh_target(&mut self, ctx: &egui::Context) {
+        if let Some((key, rx)) = &self.checking
+            && let Some(checked) = background_result(rx)
+        {
+            let checked = checked.unwrap_or_else(|| Err("Could not check this folder.".into()));
+            self.target_not_empty = checked.as_ref().is_ok_and(|c| c.1);
+            self.target = checked.map(|c| c.0);
+            self.checked_for = Some(key.clone());
+            self.checking = None;
         }
+        let key = (self.src.clone(), self.dst.clone());
+        let pending = self.checking.as_ref().is_some_and(|c| c.0 == key);
+        if !pending && self.checked_for.as_ref() != Some(&key) {
+            let (src, dst) = (self.src_path(), self.dst.clone());
+            let rx = in_background(ctx, move || {
+                target_check(&src, &dst).map(|nb| {
+                    let not_empty = needs_confirmation(&nb);
+                    (nb, not_empty)
+                })
+            });
+            self.checking = Some((key, rx));
+        }
+    }
+
+    /// The target check belongs to the text in the boxes.
+    fn target_current(&self) -> bool {
+        self.checked_for.as_ref().is_some_and(|(s, d)| *s == self.src && *d == self.dst)
     }
 
     /// The count belongs to the text in the box and found at least one section.
@@ -117,6 +160,8 @@ impl ImportWin {
         }
         self.step = Step::Target;
         self.message.clear();
+        // The target folder may have changed since it was last checked.
+        self.checked_for = None;
         true
     }
 
@@ -205,19 +250,21 @@ impl ImportWin {
         true
     }
 
-    /// NoteCraft is closing: asks the import to stop and waits a while for the section being
-    /// written, so no page is left half written.
-    pub fn stop_before_exit(&mut self) {
+    /// NoteCraft is closing: asks the import to stop. Returns true while NoteCraft should stay
+    /// open so the section being written is finished, at most `EXIT_WAIT` from the first call.
+    /// The UI keeps running meanwhile; `exit_ready` tells when to close.
+    pub fn hold_exit(&mut self) -> bool {
         self.cancel.store(true, Ordering::Relaxed);
-        let Some(rx) = self.rx.take() else { return };
-        let until = Instant::now() + EXIT_WAIT;
-        loop {
-            let left = until.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(left) {
-                Ok(Progress::Done(_)) | Err(_) => break,
-                Ok(_) => {}
-            }
+        if !self.running() {
+            return false;
         }
+        let deadline = *self.exit_deadline.get_or_insert_with(|| Instant::now() + EXIT_WAIT);
+        Instant::now() < deadline
+    }
+
+    /// An exit held by `hold_exit` can go on: the import has stopped or the wait is over.
+    pub fn exit_ready(&self) -> bool {
+        self.exit_deadline.is_some_and(|d| !self.running() || Instant::now() >= d)
     }
 
     fn source_step(&mut self, ui: &mut egui::Ui, next: &mut bool, close: &mut bool) {
@@ -249,6 +296,9 @@ impl ImportWin {
             }
             Err(e) if counted && !e.is_empty() => {
                 ui.label(RichText::new(e).color(ERROR_TEXT));
+            }
+            _ if self.counting.as_ref().is_some_and(|c| c.0 == self.src) => {
+                ui.label(RichText::new("Looking for sections…").color(MUTED));
             }
             _ => {
                 ui.label("");
@@ -288,13 +338,17 @@ impl ImportWin {
                 }
             }
         });
-        self.refresh_target();
+        self.refresh_target(ui.ctx());
+        let current = self.target_current();
         let dst = self.dst_path();
         if dst.is_absolute() {
             let nb = onenote::notebook_dir(&self.src_path(), &dst);
             ui.label(RichText::new(format!("The notebook will be written to {}", nb.display())).color(TEXT));
         }
-        if let Err(e) = &self.target
+        if !current && !self.dst.trim().is_empty() {
+            ui.label(RichText::new("Checking the folder…").color(MUTED));
+        } else if let Err(e) = &self.target
+            && current
             && !e.is_empty()
         {
             ui.label(RichText::new(e).color(ERROR_TEXT));
@@ -317,7 +371,7 @@ impl ImportWin {
             });
             return;
         }
-        let ok = self.target.is_ok();
+        let ok = current && self.target.is_ok();
         ui.horizontal(|ui| {
             if ui.button("< Back").clicked() {
                 self.back();
@@ -375,6 +429,27 @@ impl Drop for ImportWin {
     /// A thread that outlives the window stops after its current section.
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Runs `f` on its own thread (a slow network share must not freeze the window) and asks for a
+/// repaint when its result is there.
+fn in_background<T: Send + 'static>(ctx: &egui::Context, f: impl FnOnce() -> T + Send + 'static) -> mpsc::Receiver<T> {
+    let (tx, rx) = mpsc::channel();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+        ctx.request_repaint();
+    });
+    rx
+}
+
+/// The result of an `in_background` call: None while it runs, Some(None) when its thread died.
+fn background_result<T>(rx: &mpsc::Receiver<T>) -> Option<Option<T>> {
+    match rx.try_recv() {
+        Ok(v) => Some(Some(v)),
+        Err(mpsc::TryRecvError::Empty) => None,
+        Err(mpsc::TryRecvError::Disconnected) => Some(None),
     }
 }
 
@@ -477,6 +552,18 @@ fn imported_pages(r: &Report) -> usize {
     r.pages_written + r.pages_replaced + r.pages_unchanged
 }
 
+/// The status line after an import: "Imported 1 page from OneNote", or for a cancelled import
+/// "OneNote import cancelled; 12 pages imported".
+fn status_text(r: &Report) -> String {
+    let n = imported_pages(r);
+    let pages = if n == 1 { "page" } else { "pages" };
+    if r.cancelled {
+        format!("OneNote import cancelled; {n} {pages} imported")
+    } else {
+        format!("Imported {n} {pages} from OneNote")
+    }
+}
+
 /// The folder in the trees with this path.
 fn find_folder<'a>(f: &'a Folder, path: &Path) -> Option<&'a Folder> {
     if f.path == path {
@@ -526,7 +613,7 @@ impl NoteApp {
         if let Some(dir) = shown {
             self.select_folder(dir, false);
         }
-        self.set_status(format!("Imported {} pages from OneNote", imported_pages(report)));
+        self.set_status(status_text(report));
     }
 
     pub(super) fn import_window(&mut self, ctx: &egui::Context) {
@@ -554,10 +641,11 @@ impl NoteApp {
                 Step::Source => {
                     win.next_from_source();
                 }
-                Step::Target => {
-                    let not_empty = win.target.as_ref().is_ok_and(|nb| needs_confirmation(nb));
+                Step::Target if win.target_current() => {
+                    let not_empty = win.target_not_empty;
                     start = win.next_from_target(not_empty);
                 }
+                Step::Target => {}
                 Step::Run => {}
             }
         }
@@ -619,6 +707,45 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// Calls `step` until `done` holds, at most 5 s (the checks run on their own threads).
+    fn wait_for(w: &mut ImportWin, step: impl Fn(&mut ImportWin), done: impl Fn(&ImportWin) -> bool) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !done(w) {
+            assert!(Instant::now() < until, "background check did not finish");
+            step(w);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn count_and_target_check_run_in_the_background() {
+        let d = temp("background");
+        let src = d.join("Book");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("A.one"), "x").unwrap();
+        let ctx = egui::Context::default();
+        let mut w = ImportWin::new(Some(src.clone()), Some(d.join("out")));
+        w.refresh_count(&ctx);
+        assert!(w.counting.is_some());
+        wait_for(&mut w, |w| w.refresh_count(&ctx), |w| w.source_ok());
+        assert_eq!(w.found, Ok((1, 1)));
+        assert!(w.next_from_source());
+
+        w.refresh_target(&ctx);
+        assert!(!w.target_current());
+        wait_for(&mut w, |w| w.refresh_target(&ctx), |w| w.target_current());
+        assert_eq!(w.target, Ok(d.join("out").join("Book")));
+        assert!(!w.target_not_empty);
+
+        // a non-empty notebook folder is noticed; a changed text makes the old check stale
+        fs::create_dir_all(d.join("out").join("Book").join("x")).unwrap();
+        w.dst = d.join("out").display().to_string() + "\\";
+        assert!(!w.target_current());
+        wait_for(&mut w, |w| w.refresh_target(&ctx), |w| w.target_current());
+        assert!(w.target_not_empty);
+        let _ = fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn recount_waits_for_typing_to_pause() {
         assert!(recount_due(None, "x", None));
@@ -671,6 +798,11 @@ mod tests {
     fn status_counts_all_imported_pages() {
         let r = Report { pages_written: 2, pages_replaced: 3, pages_unchanged: 4, ..Default::default() };
         assert_eq!(imported_pages(&r), 9);
+        assert_eq!(status_text(&r), "Imported 9 pages from OneNote");
+        let one = Report { pages_unchanged: 1, ..Default::default() };
+        assert_eq!(status_text(&one), "Imported 1 page from OneNote");
+        let stopped = Report { pages_written: 1, cancelled: true, ..Default::default() };
+        assert_eq!(status_text(&stopped), "OneNote import cancelled; 1 page imported");
     }
 
     fn win_with_target(nb: &str) -> ImportWin {
@@ -751,20 +883,30 @@ mod tests {
     }
 
     #[test]
-    fn stop_before_exit_returns_when_done_arrives() {
+    fn exit_waits_for_the_import_without_blocking() {
+        let mut w = win_with_target(r"D:\Out\Book");
+        assert!(!w.hold_exit(), "nothing running: close at once");
+        assert!(!w.exit_ready(), "no exit was held");
+
         let mut w = win_with_target(r"D:\Out\Book");
         let (tx, rx) = mpsc::channel();
         w.rx = Some(rx);
-        let flag = w.cancel.clone();
-        let t = std::thread::spawn(move || {
-            while !flag.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let _ = tx.send(Progress::Done(Report::default()));
-        });
-        w.stop_before_exit();
-        assert!(!w.running());
-        t.join().unwrap();
+        assert!(w.hold_exit());
+        assert!(w.cancel.load(Ordering::Relaxed));
+        assert!(!w.exit_ready());
+        tx.send(Progress::Done(Report { cancelled: true, ..Default::default() })).unwrap();
+        assert!(w.poll());
+        assert!(w.exit_ready());
+        assert!(!w.hold_exit(), "the second close goes through");
+
+        // an import that never stops: the wait ends at the deadline
+        let mut w = win_with_target(r"D:\Out\Book");
+        let (_tx, rx) = mpsc::channel::<Progress>();
+        w.rx = Some(rx);
+        assert!(w.hold_exit());
+        w.exit_deadline = Some(Instant::now() - Duration::from_millis(1));
+        assert!(w.exit_ready());
+        assert!(!w.hold_exit());
     }
 
     #[test]

@@ -235,6 +235,9 @@ pub fn time32(b: &[u8]) -> Option<NaiveDateTime> {
 const MAX_DEPTH: u32 = 32;
 /// Largest accepted array of elements that take no bytes (types 1 and 2).
 const MAX_EMPTY_ARRAY: usize = 65_536;
+/// Most values (array elements and object ids) one property set may produce. Each array is
+/// bounded by the data, but nested arrays multiply; this keeps a crafted set from exhausting memory.
+const MAX_PROPSET_VALUES: usize = 1 << 20;
 
 /// Reads the property set at `pos`: the object, object space and context id streams,
 /// then the properties. `cid` turns a raw compact id into an object id.
@@ -260,7 +263,7 @@ pub fn read_propset(r: &Rd, pos: usize, cid: &dyn Fn(u32) -> Option<ObjId>) -> R
         ctxs = s;
         pos = p;
     }
-    let mut st = PropState { r, oids, osids, ctxs, cur: [0; 3] };
+    let mut st = PropState { r, oids, osids, ctxs, cur: [0; 3], budget: MAX_PROPSET_VALUES };
     let (props, _) = st.prop_set(pos, 0)?;
     Ok(props)
 }
@@ -272,11 +275,22 @@ struct PropState<'a, 'b> {
     ctxs: Vec<Option<ObjId>>,
     /// Next unused entry of the oid, osid and context streams.
     cur: [usize; 3],
+    /// Values this property set may still produce (see `MAX_PROPSET_VALUES`).
+    budget: usize,
 }
 
 impl PropState<'_, '_> {
+    /// Uses up `n` values of the budget; an error when the set would produce too many.
+    fn spend(&mut self, n: usize) -> Result<(), String> {
+        self.budget = self
+            .budget
+            .checked_sub(n)
+            .ok_or_else(|| format!("property set has more than {MAX_PROPSET_VALUES} values"))?;
+        Ok(())
+    }
+
     /// Takes the next `count` ids of stream `which` (0 oid, 1 osid, 2 context); short streams give fewer.
-    fn take(&mut self, which: usize, count: usize) -> Vec<Option<ObjId>> {
+    fn take(&mut self, which: usize, count: usize) -> Result<Vec<Option<ObjId>>, String> {
         let list = match which {
             0 => &self.oids,
             1 => &self.osids,
@@ -285,7 +299,9 @@ impl PropState<'_, '_> {
         let start = self.cur[which].min(list.len());
         let end = start.saturating_add(count).min(list.len());
         self.cur[which] = self.cur[which].saturating_add(count);
-        list[start..end].to_vec()
+        let ids = list[start..end].to_vec();
+        self.spend(ids.len())?;
+        Ok(ids)
     }
 
     fn prop_set(&mut self, pos: usize, depth: u32) -> Result<(PropSet, usize), String> {
@@ -312,6 +328,7 @@ impl PropState<'_, '_> {
         if depth > MAX_DEPTH {
             return Err("property values are nested too deeply".to_string());
         }
+        self.spend(1)?;
         Ok(match t {
             1 => (PropValue::NoData, pos),
             2 => (PropValue::Bool(prid >> 31 != 0), pos),
@@ -323,10 +340,10 @@ impl PropState<'_, '_> {
                 let cb = r.u32_at(pos)? as usize;
                 (PropValue::Bytes(r.bytes(pos + 4, cb)?.to_vec()), pos + 4 + cb)
             }
-            8 | 0xA | 0xC => (PropValue::Ids(self.take(((t - 8) / 2) as usize, 1)), pos),
+            8 | 0xA | 0xC => (PropValue::Ids(self.take(((t - 8) / 2) as usize, 1)?), pos),
             9 | 0xB | 0xD => {
                 let cnt = r.u32_at(pos)? as usize;
-                (PropValue::Ids(self.take(((t - 9) / 2) as usize, cnt)), pos + 4)
+                (PropValue::Ids(self.take(((t - 9) / 2) as usize, cnt)?), pos + 4)
             }
             0x10 => {
                 let cnt = r.u32_at(pos)? as usize;
@@ -912,6 +929,30 @@ mod tests {
         body.extend(0x1400_0000u32.to_le_bytes());
         let b = one_prop(0x4000_0010, &body);
         assert!(read_propset(&Rd::new(&b), 0, &cid).is_err());
+    }
+
+    #[test]
+    fn nested_arrays_over_the_value_budget_are_err() {
+        // 100 arrays of 65536 "no data" elements each: every array is within its own limit,
+        // together they are 6.5 million values
+        let mut body = 100u32.to_le_bytes().to_vec();
+        body.extend(0x4000_0000u32.to_le_bytes()); // elements are arrays
+        for _ in 0..100 {
+            body.extend(65_536u32.to_le_bytes());
+            body.extend(0x0400_0000u32.to_le_bytes());
+        }
+        let b = one_prop(0x4000_0010, &body);
+        let e = read_propset(&Rd::new(&b), 0, &cid).unwrap_err();
+        assert!(e.contains("values"), "{e}");
+        // 10 such arrays fit
+        let mut body = 10u32.to_le_bytes().to_vec();
+        body.extend(0x4000_0000u32.to_le_bytes());
+        for _ in 0..10 {
+            body.extend(65_536u32.to_le_bytes());
+            body.extend(0x0400_0000u32.to_le_bytes());
+        }
+        let b = one_prop(0x4000_0010, &body);
+        assert!(read_propset(&Rd::new(&b), 0, &cid).is_ok());
     }
 
     #[test]
