@@ -35,6 +35,9 @@ pub struct MoveDialog {
 /// Counts dialog openings for `MoveDialog::salt`.
 static OPENINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Height of one notebook row in the drop strip shown during a drag (with the gap below it).
+const NOTEBOOK_DROP_ROW: f32 = 30.0;
+
 /// What is carried while a page is dragged: its path and title.
 pub struct DragPage(pub PathBuf, pub String);
 
@@ -79,6 +82,48 @@ impl NoteApp {
         ui.painter().rect_stroke(resp.rect, CornerRadius::same(4), Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
         if let Some(s) = resp.dnd_release_payload::<DragSection>() {
             self.actions.push(Action::MoveSection { folder: s.0.clone(), target: target.to_path_buf() });
+        }
+    }
+
+    /// While a page or section is dragged: the other open notebooks (only the shown one has a tree to
+    /// drop on). Empty when nothing is dragged.
+    pub(super) fn drop_notebooks(&self, ctx: &egui::Context) -> Vec<usize> {
+        let dragging = egui::DragAndDrop::has_payload_of_type::<DragPage>(ctx)
+            || egui::DragAndDrop::has_payload_of_type::<DragSection>(ctx);
+        if !dragging {
+            return Vec::new();
+        }
+        (0..self.roots.len()).filter(|&i| i != self.active).collect()
+    }
+
+    /// Height of `notebook_drop_strip` for `count` notebooks.
+    pub(super) fn drop_strip_height(count: usize) -> f32 {
+        if count == 0 { 0.0 } else { 26.0 + NOTEBOOK_DROP_ROW * count as f32 }
+    }
+
+    /// Below the tree during a drag: one drop row for each of the other notebooks, `drop_notebooks`.
+    pub(super) fn notebook_drop_strip(&mut self, ui: &mut egui::Ui, notebooks: &[usize]) {
+        if notebooks.is_empty() {
+            return;
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new("Drop into another notebook").color(MUTED).size(12.0));
+        for &i in notebooks {
+            let Some(root) = self.roots.get(i).cloned() else { continue };
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), NOTEBOOK_DROP_ROW - 4.0), Sense::hover());
+            ui.painter().rect_filled(rect, CornerRadius::same(4), HOVER_SOFT);
+            let chip = egui::Rect::from_min_size(rect.left_top() + Vec2::new(6.0, 4.0), Vec2::new(12.0, rect.height() - 8.0));
+            ui.painter().rect_filled(chip, CornerRadius::same(2), ACCENT);
+            ui.painter().text(
+                rect.left_center() + Vec2::new(26.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                folder_name(&root),
+                FontId::proportional(14.0),
+                TEXT,
+            );
+            self.page_drop_target(ui, &resp, &root);
+            self.section_drop_target(ui, &resp, &root);
+            ui.add_space(4.0);
         }
     }
 
@@ -142,25 +187,19 @@ impl NoteApp {
         }
         page_free(page)?;
         let sub = store::subpage_dir(page);
-        // The open page, as a path relative to the moved page's folder, when it moves along.
-        let open_rel = self
-            .release_open_page(|p| p == page || p.starts_with(&sub))?
-            .and_then(|p| p.strip_prefix(page.parent()?).ok().map(|r| r.to_path_buf()));
+        // The open page, when it moves along, and its path relative to the moved page's folder.
+        let open = self.release_open_page(|p| p == page || p.starts_with(&sub))?;
+        let open_rel = open
+            .as_ref()
+            .and_then(|r| r.path.strip_prefix(page.parent()?).ok().map(|r| r.to_path_buf()));
         let title = store::read_doc(page).map(|d| d.title_or(page)).unwrap_or_else(|_| store::file_stem(page));
-        let result = mover::move_page(page, target_dir);
-        let new = match result {
+        let new = match mover::move_page(page, target_dir) {
             Ok(Some(new)) => new,
-            Ok(None) => {
-                if let Some(rel) = &open_rel {
-                    self.open_page(&page.parent().unwrap_or(Path::new(".")).join(rel));
+            other => {
+                if let Some(r) = &open {
+                    self.reopen(r, &r.path.clone());
                 }
-                return Ok(());
-            }
-            Err(e) => {
-                if let Some(rel) = &open_rel {
-                    self.open_page(&page.parent().unwrap_or(Path::new(".")).join(rel));
-                }
-                return Err(e);
+                return other.map(|_| ());
             }
         };
         self.index.remove(page);
@@ -170,7 +209,7 @@ impl NoteApp {
         self.index_stale = true;
         self.reload_tree();
         self.reload_pages();
-        if let Some(rel) = open_rel {
+        if let (Some(r), Some(rel)) = (&open, open_rel) {
             // `rel` starts with the old file name (page) or the old subpage folder name.
             let mut parts = rel.components();
             let first = parts.next().map(|c| c.as_os_str().to_string_lossy().to_string()).unwrap_or_default();
@@ -180,7 +219,7 @@ impl NoteApp {
             } else {
                 store::subpage_dir(&new).join(rest)
             };
-            self.open_page(&reopened);
+            self.reopen(r, &reopened);
         }
         self.set_status(format!("Moved \"{title}\" to {}", self.index.place_of(&new)));
         Ok(())
@@ -191,34 +230,11 @@ impl NoteApp {
         if !mover::can_move_section_to(folder, target) {
             return Ok(());
         }
-        folder_free(folder)?;
-        let open = self.release_open_page(|p| p.starts_with(folder))?;
-        let new = match mover::move_section(folder, target) {
-            Ok(Some(new)) => new,
-            other => {
-                if let Some(p) = &open {
-                    self.open_page(p);
-                }
-                return other.map(|_| ());
-            }
+        let Some(new) = self.relocate_folder(folder, || mover::move_section(folder, target))? else {
+            return Ok(());
         };
-        self.index.remove_tree(folder);
-        self.index.add_tree(&new);
-        self.index_stale = true;
-        if let Some(sel) = self.selected_folder.clone()
-            && let Ok(rest) = sel.strip_prefix(folder)
-        {
-            self.selected_folder = Some(new.join(rest));
-            // The selection follows the section, also into another notebook.
-            self.show_root_of(&new);
-        }
-        self.reload_tree();
-        self.reload_pages();
-        if let Some(p) = open {
-            let moved = p.strip_prefix(folder).map(|rest| new.join(rest)).unwrap_or(p.clone());
-            self.open_page(&moved);
-        }
-        self.set_status(format!("Moved section \"{}\" to {}", folder_name(folder), self.index.place_of(&new)));
+        // `new` carries the final name ("Name (2)" after a name clash).
+        self.set_status(format!("Moved section \"{}\" to {}", folder_name(&new), self.index.place_of(&new)));
         Ok(())
     }
 
