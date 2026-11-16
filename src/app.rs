@@ -85,6 +85,10 @@ enum Action {
     ShowMove(PathBuf),
     /// Move a page into a folder (a section, or the subpage folder of another page).
     MovePage { page: PathBuf, target_dir: PathBuf },
+    /// Open the "Move to…" dialog for a section.
+    ShowMoveSection(PathBuf),
+    /// Move a section folder into another folder.
+    MoveSection { folder: PathBuf, target: PathBuf },
     NewSection(PathBuf),
     RenameSection(PathBuf),
     DeleteSection(PathBuf),
@@ -687,6 +691,12 @@ impl NoteApp {
                         self.show_message("Move page", e);
                     }
                 }
+                Action::ShowMoveSection(f) => self.open_move_section(f),
+                Action::MoveSection { folder, target } => {
+                    if let Err(e) = self.do_move_section(&folder, &target) {
+                        self.show_message("Move section", e);
+                    }
+                }
                 Action::DeletePage(p) => {
                     let title = store::read_doc(&p).map(|d| d.title_or(&p)).unwrap_or_default();
                     let subpages = store::subpage_dir(&p).is_dir();
@@ -1005,6 +1015,8 @@ impl NoteApp {
         let selected = self.selected_folder.as_ref() == Some(&f.path);
         let width = ui.available_width().max(60.0);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::click());
+        // Sections and section groups can be dragged; open notebooks cannot.
+        let resp = if self.roots.contains(&f.path) { resp } else { Self::section_drag_source(&resp, &f.path, name) };
         let painter = ui.painter_at(rect);
         if selected {
             painter.rect_filled(rect, CornerRadius::same(4), ACCENT_SOFT);
@@ -1027,6 +1039,7 @@ impl NoteApp {
             self.actions.push(Action::SelectFolder(f.path.clone()));
         }
         self.page_drop_target(ui, &resp, &f.path);
+        self.section_drop_target(ui, &resp, &f.path);
         let path = f.path.clone();
         let is_root = self.roots.contains(&path);
         let resp = resp.on_hover_text(name);
@@ -1049,6 +1062,10 @@ impl NoteApp {
             } else {
                 if ui.button("Rename…").clicked() {
                     self.actions.push(Action::RenameSection(path.clone()));
+                    ui.close();
+                }
+                if ui.button("Move to…").clicked() {
+                    self.actions.push(Action::ShowMoveSection(path.clone()));
                     ui.close();
                 }
                 if ui.button("Delete…").clicked() {
