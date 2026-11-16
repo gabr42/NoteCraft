@@ -518,6 +518,22 @@ impl NoteApp {
         }
     }
 
+    /// Before a page or folder operation: when the open page matches `inside`, saves it, drops this
+    /// computer's edit lock and closes it. Returns its path, so the caller can open it again.
+    /// Refuses (and changes nothing) when its text could not be saved.
+    pub(super) fn release_open_page(&mut self, inside: impl Fn(&Path) -> bool) -> Result<Option<PathBuf>, String> {
+        if !self.page.as_ref().is_some_and(|p| inside(&p.path)) {
+            return Ok(None);
+        }
+        self.save_if_dirty();
+        // A failed save keeps the text only in the open page: do not drop it.
+        if self.page.as_ref().is_some_and(|p| p.body != p.saved_body) {
+            return Err("The open page could not be saved, so nothing was changed. Save it first.".into());
+        }
+        self.leave_edit();
+        Ok(self.page.take().map(|p| p.path))
+    }
+
     /// Keeps the text from here as a separate page instead of overwriting the other version.
     fn save_conflict(&mut self, reason: &str) {
         let Some(p) = self.page.take() else { return };
@@ -1587,7 +1603,16 @@ impl NoteApp {
             Dialog::RenameSection { path, name } => {
                 need(name)?;
                 folder_free(path)?;
-                let new_path = store::rename_folder(path, name)?;
+                let open = self.release_open_page(|p| p.starts_with(path))?;
+                let new_path = match store::rename_folder(path, name) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        if let Some(p) = &open {
+                            self.open_page(p);
+                        }
+                        return Err(e);
+                    }
+                };
                 self.index.remove_tree(path);
                 self.index.add_tree(&new_path);
                 self.index_stale = true;
@@ -1596,8 +1621,8 @@ impl NoteApp {
                 {
                     self.selected_folder = Some(new_path.join(rest));
                 }
-                if let Some(p) = self.page.take() {
-                    let moved = p.path.strip_prefix(path).map(|rest| new_path.join(rest)).unwrap_or(p.path.clone());
+                if let Some(p) = open {
+                    let moved = p.strip_prefix(path).map(|rest| new_path.join(rest)).unwrap_or(p.clone());
                     self.open_page(&moved);
                 }
                 self.reload_tree();
@@ -1606,12 +1631,15 @@ impl NoteApp {
             }
             Dialog::DeleteSection { path, name, .. } => {
                 folder_free(path)?;
-                store::delete_folder(path)?;
+                let open = self.release_open_page(|p| p.starts_with(path))?;
+                if let Err(e) = store::delete_folder(path) {
+                    if let Some(p) = &open {
+                        self.open_page(p);
+                    }
+                    return Err(e);
+                }
                 self.index.remove_tree(path);
                 self.index_stale = true;
-                if self.page.as_ref().is_some_and(|p| p.path.starts_with(path)) {
-                    self.page = None;
-                }
                 if self.selected_folder.as_ref().is_some_and(|s| s.starts_with(path)) {
                     self.selected_folder = None;
                     self.pages.clear();

@@ -93,19 +93,8 @@ impl NoteApp {
         let sub = store::subpage_dir(page);
         // The open page, as a path relative to the moved page's folder, when it moves along.
         let open_rel = self
-            .page
-            .as_ref()
-            .filter(|p| p.path == page || p.path.starts_with(&sub))
-            .and_then(|p| p.path.strip_prefix(page.parent()?).ok().map(|r| r.to_path_buf()));
-        if open_rel.is_some() {
-            self.save_if_dirty();
-            // A failed save keeps the text only in the open page: do not drop it.
-            if self.page.as_ref().is_some_and(|p| p.body != p.saved_body) {
-                return Err("The open page could not be saved, so it was not moved. Save it first.".into());
-            }
-            self.leave_edit();
-            self.page = None;
-        }
+            .release_open_page(|p| p == page || p.starts_with(&sub))?
+            .and_then(|p| p.strip_prefix(page.parent()?).ok().map(|r| r.to_path_buf()));
         let title = store::read_doc(page).map(|d| d.title_or(page)).unwrap_or_else(|_| store::file_stem(page));
         let result = mover::move_page(page, target_dir);
         let new = match result {
