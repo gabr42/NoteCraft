@@ -174,6 +174,9 @@ pub struct NoteApp {
     status: String,
     status_at: Instant,
     actions: Vec<Action>,
+    /// A folder to make visible in the tree the next time it is drawn: the folders above it are
+    /// expanded and it is scrolled into view. Cleared after that draw.
+    reveal: Option<PathBuf>,
 
     screenshot: Option<PathBuf>,
     frames: u64,
@@ -260,6 +263,7 @@ impl NoteApp {
             status_at: Instant::now(),
             actions: Vec::new(),
             screenshot,
+            reveal: None,
             frames: 0,
             shot_requested: false,
             shot_saved: false,
@@ -412,6 +416,7 @@ impl NoteApp {
 
     fn select_folder(&mut self, dir: PathBuf, open_first: bool) {
         self.show_root_of(&dir);
+        self.reveal = Some(dir.clone());
         if self.selected_folder.as_ref() != Some(&dir) {
             self.selected_folder = Some(dir.clone());
         }
@@ -585,9 +590,13 @@ impl NoteApp {
         // Moving or renaming a folder changes no page text: no need to read the files again.
         self.index.relocate(folder, &new);
         self.index_stale = true;
+        // Show the folder at its new place, also inside a collapsed group (only when its notebook is
+        // shown), or the selection when that was inside it.
+        self.reveal = Some(new.clone());
         if let Some(sel) = self.selected_folder.clone()
             && let Some(moved) = store::rebase(&sel, folder, &new)
         {
+            self.reveal = Some(moved.clone());
             self.selected_folder = Some(moved);
             // The selection follows the folder, also into another notebook.
             self.show_root_of(&new);
@@ -1054,6 +1063,7 @@ impl NoteApp {
                     self.folder_leaf(ui, &tree, 0, "(top folder)");
                 }
             });
+            self.reveal = None;
             self.notebook_drop_strip(ui, &drop_notebooks);
         });
     }
@@ -1064,9 +1074,10 @@ impl NoteApp {
             return;
         }
         let id = Id::unique(("folder", &f.path));
-        let on_path = self.selected_folder.as_ref().is_some_and(|s| store::is_within(s, &f.path) && !store::same_path(s, &f.path));
+        let above = |p: &Option<PathBuf>| p.as_ref().is_some_and(|s| store::is_within(s, &f.path) && !store::same_path(s, &f.path));
+        let on_path = above(&self.selected_folder);
         let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, depth < 2 || on_path);
-        if on_path && !state.is_open() && self.frames < 3 {
+        if above(&self.reveal) && !state.is_open() {
             state.set_open(true);
         }
         let header = state.show_header(ui, |ui| {
@@ -1092,6 +1103,9 @@ impl NoteApp {
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::click());
         // Sections and section groups can be dragged; open notebooks cannot.
         let resp = if self.roots.contains(&f.path) { resp } else { Self::section_drag_source(&resp, &f.path, name) };
+        if self.reveal.as_ref().is_some_and(|r| store::same_path(r, &f.path)) {
+            resp.scroll_to_me(None);
+        }
         let painter = ui.painter_at(rect);
         if selected {
             painter.rect_filled(rect, CornerRadius::same(4), ACCENT_SOFT);
