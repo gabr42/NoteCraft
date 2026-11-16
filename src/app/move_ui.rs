@@ -17,7 +17,12 @@ pub struct MoveDialog {
     /// The section the page is in now; its branch starts open.
     home: PathBuf,
     message: String,
+    /// Differs for every opening, so branches start collapsed again (except the way to `home`).
+    salt: u64,
 }
+
+/// Counts dialog openings for `MoveDialog::salt`.
+static OPENINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What is carried while a page is dragged: its path and title.
 pub struct DragPage(pub PathBuf, pub String);
@@ -68,6 +73,7 @@ impl NoteApp {
             pages: HashMap::new(),
             home,
             message: String::new(),
+            salt: OPENINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         });
     }
 
@@ -134,14 +140,19 @@ impl NoteApp {
     }
 
     fn move_folder_rows(&self, ui: &mut egui::Ui, win: &mut MoveDialog, f: &Folder, depth: usize) {
-        let id = Id::unique(("move-folder", &f.path));
-        let open_default = depth == 0 || win.home.starts_with(&f.path);
+        let id = Id::unique(("move-folder", win.salt, &f.path));
+        let open_default = win.home.starts_with(&f.path);
         let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, open_default);
         let is_open = state.is_open();
         state
             .show_header(ui, |ui| {
                 let ok = mover::can_move_to(&win.page, &f.path);
                 let selected = win.selected.as_ref() == Some(&f.path);
+                // The same colour chip as in the main tree: wide for a notebook, narrow for a section.
+                let is_notebook = depth == 0 && !f.children.is_empty();
+                let color = if is_notebook { ACCENT } else { section_color(&f.name) };
+                let (chip, _) = ui.allocate_exact_size(Vec2::new(if is_notebook { 12.0 } else { 5.0 }, 14.0), Sense::hover());
+                ui.painter().rect_filled(chip, CornerRadius::same(2), color);
                 let text = RichText::new(&f.name).strong();
                 let r = ui.add_enabled(ok, egui::Button::selectable(selected, text));
                 if r.clicked() {
@@ -161,7 +172,8 @@ impl NoteApp {
                         let selected = win.selected.as_ref() == Some(&target);
                         ui.horizontal(|ui| {
                             ui.add_space(14.0 * pg.level as f32);
-                            let r = ui.add_enabled(ok, egui::Button::selectable(selected, RichText::new(&pg.title).color(TEXT)));
+                            let text = RichText::new(format!("📄 {}", pg.title)).color(TEXT);
+                            let r = ui.add_enabled(ok, egui::Button::selectable(selected, text));
                             if r.clicked() {
                                 win.selected = Some(target.clone());
                                 win.selected_label = format!("under \"{}\"", pg.title);
