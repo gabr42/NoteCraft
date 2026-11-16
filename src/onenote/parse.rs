@@ -221,6 +221,8 @@ pub fn time32(b: &[u8]) -> Option<NaiveDateTime> {
 }
 
 const MAX_DEPTH: u32 = 32;
+/// Largest accepted array of elements that take no bytes (types 1 and 2).
+const MAX_EMPTY_ARRAY: usize = 65_536;
 
 /// Reads the property set at `pos`: the object, object space and context id streams,
 /// then the properties. `cid` turns a raw compact id into an object id.
@@ -295,6 +297,9 @@ impl PropState<'_, '_> {
 
     fn value(&mut self, t: u32, prid: u32, pos: usize, depth: u32) -> Result<(PropValue, usize), String> {
         let r = self.r;
+        if depth > MAX_DEPTH {
+            return Err("property values are nested too deeply".to_string());
+        }
         Ok(match t {
             1 => (PropValue::NoData, pos),
             2 => (PropValue::Bool(prid >> 31 != 0), pos),
@@ -314,17 +319,32 @@ impl PropState<'_, '_> {
             0x10 => {
                 let cnt = r.u32_at(pos)? as usize;
                 let mut pos = pos + 4;
-                // Element types such as "no data" consume no bytes, so bound the count by the data size.
-                if cnt > r.d.len() {
-                    return Err(format!("property array of {cnt} elements is larger than the data"));
-                }
                 let mut out = Vec::new();
                 if cnt > 0 {
                     let sub = r.u32_at(pos)?;
                     pos += 4;
                     let st = (sub >> 26) & 0x1F;
+                    // A real array cannot have more elements than the data (or the id stream) can hold:
+                    // elements that take bytes are bounded by remaining bytes / smallest element size,
+                    // id elements (types 8, A, C) by the unused ids of their stream, and elements that
+                    // take nothing (types 1, 2) by a fixed cap.
+                    let max = match st {
+                        1 | 2 => MAX_EMPTY_ARRAY,
+                        3..=6 => (r.d.len().saturating_sub(pos)) >> (st - 3),
+                        7 | 9 | 0xB | 0xD | 0x10 => r.d.len().saturating_sub(pos) / 4,
+                        8 | 0xA | 0xC => {
+                            let which = ((st - 8) / 2) as usize;
+                            let len = [&self.oids, &self.osids, &self.ctxs][which].len();
+                            len.saturating_sub(self.cur[which])
+                        }
+                        0x11 => r.d.len().saturating_sub(pos) / 2,
+                        _ => 0,
+                    };
+                    if cnt > max {
+                        return Err(format!("property array of {cnt} elements is larger than the data allows"));
+                    }
                     for _ in 0..cnt {
-                        let (v, p) = self.value(st, sub, pos, depth)?;
+                        let (v, p) = self.value(st, sub, pos, depth + 1)?;
                         pos = p;
                         out.push(v);
                     }
@@ -393,7 +413,8 @@ mod tests {
         const P_ARR: u32 = 0x4000_0010; // type 0x10 array
         const P_SET: u32 = 0x4400_0011; // type 0x11 nested set
         const P_INNER: u32 = 0x0C00_0042;
-        let prids = [P_NODATA, P_BOOL | 0x8000_0000, P_B1, P_B4, P_BLOB, P_ONE, P_MANY, P_ARR, P_SET];
+        const P_FALSE: u32 = 0x0800_0004; // type 2 bool, bit 31 clear
+        let prids = [P_NODATA, P_BOOL | 0x8000_0000, P_FALSE, P_B1, P_B4, P_BLOB, P_ONE, P_MANY, P_ARR, P_SET];
         b.extend((prids.len() as u16).to_le_bytes());
         for p in prids {
             b.extend(p.to_le_bytes());
@@ -417,6 +438,8 @@ mod tests {
         assert_eq!(ps.get(P_NODATA), Some(&PropValue::NoData));
         assert_eq!(ps.get(P_BOOL), Some(&PropValue::Bool(true)));
         assert!(ps.get_bool(P_BOOL));
+        assert_eq!(ps.get(P_FALSE), Some(&PropValue::Bool(false)));
+        assert!(!ps.get_bool(P_FALSE));
         assert_eq!(ps.get_bytes(P_B1), Some(&[0xABu8][..]));
         assert_eq!(ps.get_bytes(P_B4), Some(&[1u8, 2, 3, 4][..]));
         assert_eq!(ps.get_bytes(P_BLOB), Some(&[7u8, 8, 9][..]));
@@ -445,6 +468,45 @@ mod tests {
     fn guid_text() {
         let g: Guid = [0xE4, 0x52, 0x5C, 0x7B, 0x8C, 0xD8, 0xA7, 0x4D, 0xAE, 0xB1, 0x53, 0x78, 0xD0, 0x29, 0x96, 0xD3];
         assert_eq!(guid_string(&g), "7b5c52e4-d88c-4da7-aeb1-5378d02996d3");
+    }
+
+    /// Property set with no ids and one property `prid`, followed by `body`.
+    fn one_prop(prid: u32, body: &[u8]) -> Vec<u8> {
+        let mut b = (1u32 << 31).to_le_bytes().to_vec();
+        b.extend(1u16.to_le_bytes());
+        b.extend(prid.to_le_bytes());
+        b.extend(body);
+        b
+    }
+
+    #[test]
+    fn deeply_nested_array_is_err() {
+        let mut body = Vec::new();
+        for _ in 0..200 {
+            body.extend(1u32.to_le_bytes()); // one element
+            body.extend(0x4000_0000u32.to_le_bytes()); // element type 0x10 again
+        }
+        let b = one_prop(0x4000_0010, &body);
+        assert!(read_propset(&Rd::new(&b), 0, &cid).is_err());
+    }
+
+    #[test]
+    fn oversized_zero_width_array_is_err() {
+        // 100000 "no data" elements
+        let mut body = 100_000u32.to_le_bytes().to_vec();
+        body.extend(0x0400_0000u32.to_le_bytes());
+        let b = one_prop(0x4000_0010, &body);
+        assert!(read_propset(&Rd::new(&b), 0, &cid).is_err());
+        // 1000 oid elements but the oid stream is empty
+        let mut body = 1000u32.to_le_bytes().to_vec();
+        body.extend(0x2000_0000u32.to_le_bytes());
+        let b = one_prop(0x4000_0010, &body);
+        assert!(read_propset(&Rd::new(&b), 0, &cid).is_err());
+        // 1000 four-byte elements but only a few bytes follow
+        let mut body = 1000u32.to_le_bytes().to_vec();
+        body.extend(0x1400_0000u32.to_le_bytes());
+        let b = one_prop(0x4000_0010, &body);
+        assert!(read_propset(&Rd::new(&b), 0, &cid).is_err());
     }
 
     #[test]
