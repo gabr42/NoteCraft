@@ -226,11 +226,14 @@ pub struct Converter<'a> {
     page_warn: Vec<String>,
     nest: usize,
     visits: usize,
+    /// Whether the page in progress already got its depth / visit limit warning.
+    warned_nest: bool,
+    warned_visits: bool,
 }
 
 impl<'a> Converter<'a> {
     pub fn new(one: &'a OneFile, add_resource: &'a mut dyn FnMut(&[u8], &str) -> String) -> Self {
-        Converter { one, add_resource, sp: None, warnings: Vec::new(), page_warn: Vec::new(), nest: 0, visits: 0 }
+        Converter { one, add_resource, sp: None, warnings: Vec::new(), page_warn: Vec::new(), nest: 0, visits: 0, warned_nest: false, warned_visits: false }
     }
 
     // ---- helpers ----
@@ -511,8 +514,12 @@ impl<'a> Converter<'a> {
         counters: Option<&mut HashMap<usize, u32>>,
     ) -> Vec<String> {
         if self.nest >= MAX_NEST || self.visits >= MAX_VISITS {
-            if self.nest >= MAX_NEST {
+            if self.nest >= MAX_NEST && !self.warned_nest {
+                self.warned_nest = true;
                 self.page_warn.push("content nested too deeply".to_string());
+            } else if self.nest < MAX_NEST && !self.warned_visits {
+                self.warned_visits = true;
+                self.page_warn.push("too many elements".to_string());
             }
             return Vec::new();
         }
@@ -604,6 +611,8 @@ impl<'a> Converter<'a> {
         self.sp = Some(sp);
         self.nest = 0;
         self.visits = 0;
+        self.warned_nest = false;
+        self.warned_visits = false;
         let first_root = sp.roots.iter().min_by_key(|(k, _)| **k).map(|(_, v)| v);
         let root = sp
             .roots
@@ -1104,6 +1113,165 @@ mod tests {
         let a = ts.oe(&[], vec![]);
         ts.sp.objects.get_mut(&a).unwrap().props.0.insert(P_ELEM & 0x7FFF_FFFF, ids(&[a]));
         assert!(lines_of(ts, &[a], false).is_empty());
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n0123";
+
+    /// Runs the converter; returns pages, warnings and the `add_resource` calls (size, extension).
+    fn run_converter(one: &OneFile) -> (Vec<Page>, Vec<String>, Vec<(usize, String)>) {
+        let mut calls: Vec<(usize, String)> = Vec::new();
+        let mut cb = |d: &[u8], e: &str| {
+            calls.push((d.len(), e.to_string()));
+            format!("n{}{e}", calls.len())
+        };
+        let mut c = Converter::new(one, &mut cb);
+        let pages = c.section_pages().unwrap();
+        let w = c.warnings.clone();
+        drop(c);
+        (pages, w, calls)
+    }
+
+    #[test]
+    fn image_happy_path() {
+        let mut one = section_with_page(
+            |ts| {
+                let im = ts.add(J_IMAGE, vec![(P_PICTURE, ids(&[oid(500)])), (P_IMG_ALT, utf16("pic"))]);
+                vec![im]
+            },
+            "P",
+        );
+        let sp = one.spaces.get_mut(&oid(901)).unwrap();
+        sp.filedecl.insert(oid(500), ("<ifndf>{ABC-1}".to_string(), String::new()));
+        one.filedata.insert("abc-1".to_string(), PNG.to_vec());
+        let (pages, w, calls) = run_converter(&one);
+        assert!(w.is_empty());
+        assert_eq!(calls, vec![(PNG.len(), ".png".to_string())]);
+        assert_eq!(pages[0].blocks, vec![vec!["![pic](resources/n1.png)".to_string()]]);
+    }
+
+    #[test]
+    fn embedded_happy_path_and_missing() {
+        let mut one = section_with_page(
+            |ts| {
+                let e1 = ts
+                    .add(J_EMBEDDED, vec![(P_EMB_CONT, ids(&[oid(500)])), (P_EMB_NAME, utf16("My_Doc.PDF"))]);
+                let e2 = ts
+                    .add(J_EMBEDDED, vec![(P_EMB_CONT, ids(&[oid(501)])), (P_EMB_NAME, utf16("gone.txt"))]);
+                vec![e1, e2]
+            },
+            "P",
+        );
+        let sp = one.spaces.get_mut(&oid(901)).unwrap();
+        sp.filedecl.insert(oid(500), ("<ifndf>{AA}".to_string(), ".bin".to_string()));
+        sp.filedecl.insert(oid(501), ("<ifndf>{BB}".to_string(), ".txt".to_string()));
+        one.filedata.insert("aa".to_string(), b"data".to_vec());
+        let (pages, w, calls) = run_converter(&one);
+        assert_eq!(calls, vec![(4, ".pdf".to_string())]);
+        assert_eq!(pages[0].blocks[0], vec!["[My_Doc.PDF](resources/n1.pdf)".to_string()]);
+        assert_eq!(pages[0].blocks[1], vec!["`gone.txt` (attachment data missing)".to_string()]);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].starts_with("P: ") && w[0].contains("gone.txt"), "{w:?}");
+    }
+
+    #[test]
+    fn splitext_like_python() {
+        assert_eq!(splitext("a.b.TXT"), ".TXT");
+        assert_eq!(splitext(".bashrc"), "");
+        assert_eq!(splitext("dir.x\\file"), "");
+        assert_eq!(splitext("noext"), "");
+    }
+
+    #[test]
+    fn hyperlink_autolink() {
+        let mut ts = TSpace::default();
+        let rt = ts.rich("\u{fddf}HYPERLINK \"https://a.b/c\"https://a.b/c", vec![]);
+        assert_eq!(render(ts, rt), "<https://a.b/c>");
+        let mut ts = TSpace::default();
+        let rt = ts.rich("\u{fddf}HYPERLINK \"https://a.b/c\"", vec![]);
+        assert_eq!(render(ts, rt), "<https://a.b/c>");
+    }
+
+    #[test]
+    fn meta_overrides_page_values() {
+        let mut one = section_with_page(|_| Vec::new(), "Cached");
+        let ft: u64 = 13_000_000_000u64 * 10_000_000;
+        let root = one.spaces.get_mut(&oid(900)).unwrap();
+        let meta = Obj {
+            jcid: 0,
+            props: pset(vec![
+                (P_CACHED_TITLE, utf16("Meta title")),
+                (P_TOPO_CREATED, PropValue::Bytes(ft.to_le_bytes().to_vec())),
+                (P_PAGE_LEVEL, PropValue::Bytes(2u32.to_le_bytes().to_vec())),
+            ]),
+        };
+        root.objects.insert(oid(700), meta);
+        let series = root.objects.values_mut().find(|o| o.jcid == J_PAGESERIES).unwrap();
+        series.props.0.insert(P_META_ABOVE & 0x7FFF_FFFF, ids(&[oid(700)]));
+        let (pages, _, _) = run_converter(&one);
+        assert_eq!(pages[0].title, "Meta title");
+        assert_eq!(pages[0].level, 2);
+        assert!(pages[0].created.is_some());
+        assert_eq!(pages[0].created, filetime(&ft.to_le_bytes()));
+    }
+
+    #[test]
+    fn ascii_text_uses_charset() {
+        let mut ts = TSpace::default();
+        // 0xE8 is c-caron in cp1250, e-grave in cp1252
+        let a = ts.add(
+            J_RICHTEXT,
+            vec![(P_TEXT_ASCII, PropValue::Bytes(vec![0xE8, b'x'])), (P_CHARSET, PropValue::Bytes(vec![238]))],
+        );
+        let b = ts.add(J_RICHTEXT, vec![(P_TEXT_ASCII, PropValue::Bytes(vec![0xE8, b'x']))]);
+        let one = one_with(ts.sp);
+        let mut cb = |_: &[u8], _: &str| String::new();
+        let mut c = Converter::new(&one, &mut cb);
+        let sp = &one.spaces[&one.root_gosid.unwrap()];
+        c.sp = Some(sp);
+        assert_eq!(c.render_rich(&sp.objects[&a]), "\u{10D}x");
+        assert_eq!(c.render_rich(&sp.objects[&b]), "\u{E8}x");
+    }
+
+    #[test]
+    fn limit_warnings_once_per_page() {
+        // a chain of OEs nested deeper than MAX_NEST, two branches at every level
+        let one = section_with_page(
+            |ts| {
+                let mut child: Option<ObjId> = None;
+                for _ in 0..(MAX_NEST + 5) {
+                    let t = ts.rich("x", vec![]);
+                    let mut props = Vec::new();
+                    if let Some(c) = child {
+                        props.push((P_ELEM, ids(&[c, c])));
+                    }
+                    child = Some(ts.oe(&[t], props));
+                }
+                let ol = ts.add(J_OUTLINE, vec![(P_ELEM, ids(&[child.unwrap()]))]);
+                vec![ol]
+            },
+            "P",
+        );
+        let (_, w, _) = run_converter(&one);
+        assert_eq!(w.iter().filter(|x| x.contains("nested too deeply")).count(), 1, "{w:?}");
+
+        // wide and shallow: far more OE visits than allowed, no depth problem
+        let one = section_with_page(
+            |ts| {
+                let t = ts.rich("x", vec![]);
+                let leaf = ts.oe(&[t], vec![]);
+                let mut level = vec![leaf; 100];
+                for _ in 0..4 {
+                    let mid = ts.oe(&[], vec![(P_ELEM, ids(&level))]);
+                    level = vec![mid; 100];
+                }
+                let ol = ts.add(J_OUTLINE, vec![(P_ELEM, ids(&level))]);
+                vec![ol]
+            },
+            "P",
+        );
+        let (_, w, _) = run_converter(&one);
+        assert_eq!(w.iter().filter(|x| x.contains("too many elements")).count(), 1, "{w:?}");
+        assert_eq!(w.iter().filter(|x| x.contains("nested too deeply")).count(), 0, "{w:?}");
     }
 
     /// Converts the section in `ONENOTE_SAMPLE` and writes a plain dump to `ONENOTE_DUMP` (read-only on the source).
