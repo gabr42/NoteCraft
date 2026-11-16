@@ -1,6 +1,7 @@
 //! The NoteCraft window: notebooks and sections on the left, pages in the middle, the page on the right.
 
 use crate::lock::{self, EditLock};
+use crate::mover;
 use crate::render;
 use crate::store::{self, Folder, Index, PageEntry, SearchHit, SortOrder};
 use crate::web::{self, PageWeb, WebMsg};
@@ -571,7 +572,7 @@ impl NoteApp {
         op: impl FnOnce() -> Result<Option<PathBuf>, String>,
     ) -> Result<Option<PathBuf>, String> {
         folder_free(folder)?;
-        let open = self.release_open_page(|p| p.starts_with(folder))?;
+        let open = self.release_open_page(|p| mover::is_within(p, folder))?;
         let new = match op() {
             Ok(Some(new)) => new,
             other => {
@@ -585,16 +586,16 @@ impl NoteApp {
         self.index.add_tree(&new);
         self.index_stale = true;
         if let Some(sel) = self.selected_folder.clone()
-            && let Ok(rest) = sel.strip_prefix(folder)
+            && let Some(moved) = mover::rebase(&sel, folder, &new)
         {
-            self.selected_folder = Some(new.join(rest));
+            self.selected_folder = Some(moved);
             // The selection follows the folder, also into another notebook.
             self.show_root_of(&new);
         }
         self.reload_tree();
         self.reload_pages();
         if let Some(r) = open {
-            let moved = r.path.strip_prefix(folder).map(|rest| new.join(rest)).unwrap_or(r.path.clone());
+            let moved = mover::rebase(&r.path, folder, &new).unwrap_or(r.path.clone());
             self.reopen(&r, &moved);
         }
         Ok(Some(new))
@@ -1698,7 +1699,7 @@ impl NoteApp {
             }
             Dialog::DeleteSection { path, name, .. } => {
                 folder_free(path)?;
-                let open = self.release_open_page(|p| p.starts_with(path))?;
+                let open = self.release_open_page(|p| mover::is_within(p, path))?;
                 if let Err(e) = store::delete_folder(path) {
                     if let Some(r) = &open {
                         self.reopen(r, &r.path.clone());
@@ -1707,7 +1708,7 @@ impl NoteApp {
                 }
                 self.index.remove_tree(path);
                 self.index_stale = true;
-                if self.selected_folder.as_ref().is_some_and(|s| s.starts_with(path)) {
+                if self.selected_folder.as_ref().is_some_and(|s| mover::is_within(s, path)) {
                     self.selected_folder = None;
                     self.pages.clear();
                 }

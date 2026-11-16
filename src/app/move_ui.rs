@@ -1,7 +1,6 @@
 //! Moving a page or a section: the "Move to…" dialog and the moves themselves (also used by drag and drop).
 
 use super::*;
-use crate::mover;
 use std::collections::HashMap;
 
 /// What the "Move to…" dialog moves.
@@ -187,11 +186,9 @@ impl NoteApp {
         }
         page_free(page)?;
         let sub = store::subpage_dir(page);
-        // The open page, when it moves along, and its path relative to the moved page's folder.
-        let open = self.release_open_page(|p| p == page || p.starts_with(&sub))?;
-        let open_rel = open
-            .as_ref()
-            .and_then(|r| r.path.strip_prefix(page.parent()?).ok().map(|r| r.to_path_buf()));
+        // The open page, when it moves along (the page itself or one of its subpages).
+        let same = |p: &Path| store::path_key(p) == store::path_key(page);
+        let open = self.release_open_page(|p| same(p) || mover::is_within(p, &sub))?;
         let title = store::read_doc(page).map(|d| d.title_or(page)).unwrap_or_else(|_| store::file_stem(page));
         let new = match mover::move_page(page, target_dir) {
             Ok(Some(new)) => new,
@@ -209,16 +206,8 @@ impl NoteApp {
         self.index_stale = true;
         self.reload_tree();
         self.reload_pages();
-        if let (Some(r), Some(rel)) = (&open, open_rel) {
-            // `rel` starts with the old file name (page) or the old subpage folder name.
-            let mut parts = rel.components();
-            let first = parts.next().map(|c| c.as_os_str().to_string_lossy().to_string()).unwrap_or_default();
-            let rest: PathBuf = parts.collect();
-            let reopened = if first.eq_ignore_ascii_case(&format!("{}.md", store::file_stem(page))) {
-                new.clone()
-            } else {
-                store::subpage_dir(&new).join(rest)
-            };
+        if let Some(r) = &open {
+            let reopened = mover::rebase(&r.path, &sub, &store::subpage_dir(&new)).unwrap_or_else(|| new.clone());
             self.reopen(r, &reopened);
         }
         self.set_status(format!("Moved \"{title}\" to {}", self.index.place_of(&new)));
