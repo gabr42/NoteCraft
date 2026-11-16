@@ -497,7 +497,7 @@ pub fn delete_folder(path: &Path) -> Result<(), String> {
 }
 
 /// Lower-case path components, for comparing folders on a case-insensitive file system.
-fn path_key(p: &Path) -> Vec<String> {
+pub(crate) fn path_key(p: &Path) -> Vec<String> {
     p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect()
 }
 
