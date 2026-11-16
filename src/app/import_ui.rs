@@ -514,8 +514,8 @@ impl NoteApp {
         let Some(report) = &win.report else { return };
         let (src, dst) = (win.src_path(), win.dst_path());
         let nb = onenote::notebook_dir(&src, &dst);
-        if nb.is_dir() && store::check_new_root(&self.roots, &dst).is_ok() {
-            self.add_root(dst);
+        if nb.is_dir() && store::check_new_root(&self.roots, &nb).is_ok() {
+            self.add_root(nb.clone());
         } else {
             self.reload_tree();
             self.start_indexing();

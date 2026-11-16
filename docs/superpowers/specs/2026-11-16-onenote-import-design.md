@@ -93,8 +93,9 @@ The wizard is one egui window (modal, like the existing dialogs), with three ste
   the step shows a summary: sections, pages written, pages replaced, pictures/attachments written,
   and a list of problems (sections that could not be read, with the error; pages skipped because
   they are locked; missing picture data). Buttons: Close.
-- After a successful (or cancelled) import the target folder is added to NoteCraft's folder list,
-  as if added with Folders ▸ Add folder…, and shown (Claude's call). If it cannot be added (it lies
+- After a successful (or cancelled) import the notebook folder (`<target>\<notebook>`, not the
+  chosen target; user, 2026-11-16) is added to NoteCraft's folder list,
+  as if added with Folders ▸ Add folder…, and shown. If it cannot be added (it lies
   inside or contains an already added folder, see `store::check_new_root`), the tree is reloaded
   instead and the new notebook is selected if it is visible. The search index is rebuilt.
 - The wizard remembers the last source and target folders in the settings (Claude's call).

@@ -146,8 +146,8 @@ Choose **Folders ▸ Import from OneNote…**. The window has three steps:
    written; what was written stays. At the end a summary lists the sections, the new, replaced and
    unchanged pages, the number of pictures and attachments written and any problems.
 
-When the import is done the target folder is added to the folders (or, if it cannot be added, the
-view is reloaded) and the imported notebook is selected.
+When the import is done the notebook folder (`<target>\<notebook>`) is added to the folders (or, if
+it cannot be added, the view is reloaded) and the imported notebook is selected.
 
 Every OneNote section becomes a folder of pages, and the folders of the source become folders around
 them. A section or folder whose name is already taken gets `-1`, `-2` ... added to its name. A name
