@@ -446,8 +446,12 @@ pub fn save_conflict_copy(path: &Path, body: &str, computer: &str) -> Result<Pat
 pub fn rename_page(path: &Path, new_title: &str, stem: Option<&str>) -> Result<PathBuf, String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     if let Some(stem) = stem {
-        let own = stem.eq_ignore_ascii_case(&file_stem(path));
-        if !own && (dir.join(format!("{stem}.md")).exists() || dir.join(stem).exists()) {
+        let own = same_path(&dir.join(stem), &dir.join(file_stem(path)));
+        let page_taken = ["md", "markdown"].iter().any(|ext| {
+            let other = dir.join(format!("{stem}.{ext}"));
+            other.exists() && !same_path(&other, path)
+        });
+        if page_taken || (!own && dir.join(stem).exists()) {
             return Err(format!("\"{}\" already has \"{stem}\".", dir.display()));
         }
     }
@@ -903,6 +907,35 @@ more text
         let before = fs::read(&a).unwrap();
         assert!(rename_page(&a, "B", Some("B")).is_err());
         assert!(rename_page(&a, "b", Some("b")).is_err());
+        assert_eq!(fs::read(&a).unwrap(), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_page_exact_case_only_non_ascii() {
+        let root = temp_root("renunicode");
+        let page = root.join("Čaj.md");
+        fs::write(&page, "---
+title: Čaj
+---
+
+text
+").unwrap();
+        let renamed = rename_page(&page, "čaj", Some("čaj")).unwrap();
+        assert_eq!(renamed.file_name().unwrap(), "čaj.md");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_page_exact_refuses_markdown_extension() {
+        let root = temp_root("renmarkdown");
+        let a = create_page(&root, "A").unwrap();
+        fs::write(root.join("B.markdown"), "---
+title: B
+---
+").unwrap();
+        let before = fs::read(&a).unwrap();
+        assert!(rename_page(&a, "B", Some("B")).is_err());
         assert_eq!(fs::read(&a).unwrap(), before);
         let _ = fs::remove_dir_all(&root);
     }
