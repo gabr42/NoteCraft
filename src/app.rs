@@ -1695,7 +1695,7 @@ impl NoteApp {
             Dialog::RenamePage { path, title } => {
                 need(title)?;
                 page_free(path)?;
-                let new_path = store::rename_page(path, title)?;
+                let new_path = store::rename_page(path, title, None)?;
                 self.index.relocate(&store::subpage_dir(path), &store::subpage_dir(&new_path));
                 self.index.remove(path);
                 self.index.add(&new_path);

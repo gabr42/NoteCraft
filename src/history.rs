@@ -330,9 +330,13 @@ fn merge_dir(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// Puts a deleted item back into the folder it came from (created if it is gone). A name that is
-/// taken gets a number. Returns the path of the restored page or folder.
-pub fn restore_deleted(item: &DeletedItem) -> Result<PathBuf, String> {
+/// taken gets a number, or with `exact` makes this fail before anything moves. Returns the path of
+/// the restored page or folder.
+pub fn restore_deleted(item: &DeletedItem, exact: bool) -> Result<PathBuf, String> {
     let folder = &item.original_folder;
+    if exact && free_name(folder, &item.name, item.kind == ItemKind::Page) != item.name {
+        return Err(format!("\"{}\" already has \"{}\".", folder.display(), item.name));
+    }
     std::fs::create_dir_all(folder)
         .map_err(|e| format!("history::restore_deleted: could not create {}: {e}", folder.display()))?;
     let restored = match item.kind {
@@ -740,6 +744,24 @@ updated: 2026-01-02T00:00:00
     }
 
     #[test]
+    fn restore_exact_refuses_taken() {
+        let top = temp("restexact");
+        let p = page_with(&top, "P.md", "
+old
+");
+        let entry = delete_page(&p, at(9, 0)).unwrap();
+        page_with(&top, "P.md", "
+new
+");
+        let item = deleted_item_at(&entry).unwrap();
+        assert!(restore_deleted(&item, true).is_err());
+        assert!(entry.is_dir());
+        let back = restore_deleted(&item, false).unwrap();
+        assert_eq!(back, top.join("P (2).md"));
+        let _ = fs::remove_dir_all(&top);
+    }
+
+    #[test]
     fn delete_and_restore_page() {
         let top = temp("delrest");
         let d = top.join("S").join("T");
@@ -755,7 +777,7 @@ updated: 2026-01-02T00:00:00
         assert_eq!(items.len(), 1);
         assert_eq!((items[0].kind, items[0].name.as_str(), items[0].deleted_at), (ItemKind::Page, "A", at(9, 0)));
         assert_eq!(items[0].original_folder, d);
-        let back = restore_deleted(&items[0]).unwrap();
+        let back = restore_deleted(&items[0], false).unwrap();
         assert_eq!(back, p);
         assert_eq!(fs::read(&p).unwrap(), before);
         assert!(d.join("A").join("Sub.md").is_file());
@@ -786,7 +808,7 @@ updated: 2026-01-02T00:00:00
         delete_page(&p, at(9, 0)).unwrap();
         let newer = page_with(&top, "A.md", "newer");
         fs::create_dir_all(top.join("A")).unwrap();
-        let back = restore_deleted(&list_deleted(&top)[0]).unwrap();
+        let back = restore_deleted(&list_deleted(&top)[0], false).unwrap();
         assert_eq!(back, top.join("A (2).md"));
         assert!(fs::read_to_string(&newer).unwrap().contains("newer"));
         assert!(fs::read_to_string(&back).unwrap().contains("old"));
@@ -805,7 +827,7 @@ updated: 2026-01-02T00:00:00
         let items = list_deleted(&top);
         assert_eq!((items[0].kind, items[0].name.as_str()), (ItemKind::Section, "Sec"));
         assert_eq!(items[0].original_folder, top);
-        assert_eq!(restore_deleted(&items[0]).unwrap(), s);
+        assert_eq!(restore_deleted(&items[0], false).unwrap(), s);
         assert!(p.is_file());
         assert_eq!(list_versions(&p).len(), 1);
         let _ = fs::remove_dir_all(&top);
@@ -1005,7 +1027,7 @@ updated: 2026-01-02T00:00:00
         let entry = delete_page(&p, at(9, 0)).unwrap();
         let item = deleted_item_at(&entry).unwrap();
         assert_eq!((item.name.as_str(), item.kind), ("X", ItemKind::Page));
-        let back = restore_deleted(&item).unwrap();
+        let back = restore_deleted(&item, false).unwrap();
         assert_eq!(back, p);
         assert!(p.is_file());
         let _ = fs::remove_dir_all(&top);
@@ -1022,7 +1044,7 @@ updated: 2026-01-02T00:00:00
         let pages = top.join(HISTORY_DIR).join("pages");
         let _ = fs::remove_dir_all(&pages);
         fs::write(&pages, "x").unwrap();
-        assert!(restore_deleted(&item).is_err());
+        assert!(restore_deleted(&item, false).is_err());
         assert!(!p.exists(), "the page must not stay half restored");
         assert_eq!(deleted_item_at(&entry).map(|d| d.kind), Some(ItemKind::Page));
         let _ = fs::remove_dir_all(&top);
