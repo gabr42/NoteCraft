@@ -331,7 +331,7 @@ impl NoteApp {
     }
 
     /// Updates the index, the tree and the page list after a deleted item came back.
-    fn after_restore_deleted(&mut self, item: &history::DeletedItem, path: &Path) -> String {
+    pub(super) fn after_restore_deleted(&mut self, item: &history::DeletedItem, path: &Path) -> String {
         match item.kind {
             history::ItemKind::Page => {
                 self.index.add(path);

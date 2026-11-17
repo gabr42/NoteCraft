@@ -1,6 +1,3 @@
-// Used from Task 4 (app undo/redo); remove then.
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 pub const DEPTH: usize = 20;
@@ -66,10 +63,14 @@ impl UndoLog {
         self.redo.push(r);
     }
 
+    // Used by the Task 5 hover texts; remove the allow then.
+    #[allow(dead_code)]
     pub fn undo_label(&self) -> Option<&str> {
         self.undo.last().map(|r| r.label.as_str())
     }
 
+    // Used by the Task 5 hover texts; remove the allow then.
+    #[allow(dead_code)]
     pub fn redo_label(&self) -> Option<&str> {
         self.redo.last().map(|r| r.label.as_str())
     }

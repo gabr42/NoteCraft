@@ -4,6 +4,7 @@ use crate::lock::{self, EditLock};
 use crate::mover;
 use crate::render;
 use crate::store::{self, Folder, Index, PageEntry, SearchHit, SortOrder};
+use crate::undo;
 use crate::web::{self, PageWeb, WebMsg};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Id, Key, KeyboardShortcut, Layout, Margin, Modifiers, RichText,
@@ -17,6 +18,7 @@ use std::time::{Duration, Instant};
 mod history_ui;
 mod import_ui;
 mod move_ui;
+mod undo_ui;
 
 const ACCENT: Color32 = Color32::from_rgb(0x6B, 0x2F, 0xA0);
 const ACCENT_DARK: Color32 = Color32::from_rgb(0x55, 0x22, 0x82);
@@ -47,6 +49,9 @@ enum Mode {
 }
 
 /// The open page as `release_open_page` closed it, for `reopen`.
+/// Why `release_open_page` refuses; undo and redo keep their record on this one.
+const SAVE_FAILED: &str = "The open page could not be saved, so nothing was changed. Check the page first.";
+
 pub(super) struct Released {
     path: PathBuf,
     /// It was in edit mode.
@@ -215,6 +220,8 @@ pub struct NoteApp {
     /// The folders the wizard used last (remembered).
     import_src: Option<PathBuf>,
     import_dst: Option<PathBuf>,
+    /// What undo and redo can step through (this session only).
+    undo: undo::UndoLog,
 }
 
 impl NoteApp {
@@ -289,6 +296,7 @@ impl NoteApp {
             drop_allowed: false,
             import_src: settings.import_src.clone(),
             import_dst: settings.import_dst.clone(),
+            undo: undo::UndoLog::default(),
         };
         let want_page = start_page.clone().or(settings.page.clone());
         if roots.is_empty()
@@ -556,7 +564,7 @@ impl NoteApp {
             return Ok(None);
         }
         if !self.save_if_dirty() {
-            return Err("The open page could not be saved, so nothing was changed. Check the page first.".into());
+            return Err(SAVE_FAILED.into());
         }
         let editing = self.mode == Mode::Edit;
         self.leave_edit();
@@ -774,13 +782,13 @@ impl NoteApp {
                 }
                 Action::ShowMove(p) => self.open_move(p),
                 Action::MovePage { page, target_dir } => {
-                    if let Err(e) = self.do_move(&page, &target_dir) {
+                    if let Err(e) = self.do_move(&page, &target_dir, None) {
                         self.show_message("Move page", e);
                     }
                 }
                 Action::ShowMoveSection(f) => self.open_move_section(f),
                 Action::MoveSection { folder, target } => {
-                    if let Err(e) = self.do_move_section(&folder, &target) {
+                    if let Err(e) = self.do_move_section(&folder, &target, None) {
                         self.show_message("Move section", e);
                     }
                 }
@@ -1691,76 +1699,58 @@ impl NoteApp {
                 self.open_page(&path);
                 self.start_edit();
                 self.set_status(format!("Created \"{}\"", title.trim()));
+                self.undo.push(undo::Record {
+                    step: undo::Step::Create { path, section: false, entry: None },
+                    label: format!("creation of \"{}\"", title.trim()),
+                });
             }
             Dialog::RenamePage { path, title } => {
                 need(title)?;
-                page_free(path)?;
-                let new_path = store::rename_page(path, title, None)?;
-                self.index.relocate(&store::subpage_dir(path), &store::subpage_dir(&new_path));
-                self.index.remove(path);
-                self.index.add(&new_path);
-                self.index_stale = true;
-                let was_open = self.page.as_ref().is_some_and(|p| &p.path == path);
-                self.reload_tree();
-                self.reload_pages();
-                if was_open {
-                    self.page = None;
-                    self.open_page(&new_path);
-                }
+                let old_title = store::read_doc(path).map(|d| d.title_or(path)).unwrap_or_else(|_| store::file_stem(path));
+                let new_path = self.rename_page_now(path, title, None)?;
                 self.set_status(format!("Renamed to \"{}\"", title.trim()));
+                self.undo.push(undo::Record {
+                    step: undo::Step::RenamePage { from: path.clone(), to: new_path, old_title: old_title.clone(), new_title: title.trim().to_string() },
+                    label: format!("rename of \"{old_title}\""),
+                });
             }
             Dialog::DeletePage { path, title, .. } => {
-                let pos = self.pages.iter().position(|p| &p.path == path);
-                page_free(path)?;
-                store::delete_page(path)?;
-                self.index.remove(path);
-                self.index.remove_tree(&store::subpage_dir(path));
-                self.index_stale = true;
-                let was_open = self.page.as_ref().is_some_and(|p| store::is_within(&p.path, &store::subpage_dir(path)) || store::same_path(&p.path, path));
-                if was_open {
-                    self.page = None;
-                }
-                self.reload_tree();
-                self.reload_pages();
-                if was_open {
-                    let next = pos.map(|i| i.min(self.pages.len().saturating_sub(1)));
-                    if let Some(p) = next.and_then(|i| self.pages.get(i)).map(|p| p.path.clone()) {
-                        self.open_page(&p);
-                    }
-                }
+                let entry = self.delete_page_now(path)?;
                 self.set_status(format!("\"{title}\" deleted; restore it from Folders > Deleted items"));
+                self.undo.push(undo::Record {
+                    step: undo::Step::Delete { path: path.clone(), entry, section: false },
+                    label: format!("deletion of \"{title}\""),
+                });
             }
             Dialog::NewSection { parent, name } => {
                 need(name)?;
                 let path = store::create_folder(parent, name)?;
                 self.reload_tree();
-                self.select_folder(path, true);
+                self.select_folder(path.clone(), true);
                 self.set_status(format!("Created section \"{}\"", name.trim()));
+                self.undo.push(undo::Record {
+                    label: format!("creation of \"{}\"", folder_name(&path)),
+                    step: undo::Step::Create { path, section: true, entry: None },
+                });
             }
             Dialog::RenameSection { path, name } => {
                 need(name)?;
-                self.relocate_folder(path, || {
-                    store::rename_folder(path, name).map(|p| Some(mover::Moved { path: p, left_behind: Vec::new(), pictures: Vec::new() }))
-                })?;
+                let moved = self.rename_section_now(path, name)?;
                 self.set_status(format!("Section renamed to \"{}\"", name.trim()));
+                if let Some(new) = moved.filter(|n| n != path) {
+                    self.undo.push(undo::Record {
+                        step: undo::Step::RenameSection { from: path.clone(), to: new },
+                        label: format!("rename of \"{}\"", folder_name(path)),
+                    });
+                }
             }
             Dialog::DeleteSection { path, name, .. } => {
-                folder_free(path)?;
-                let open = self.release_open_page(|p| store::is_within(p, path))?;
-                if let Err(e) = store::delete_folder(path) {
-                    if let Some(r) = &open {
-                        self.reopen(r, &r.path.clone());
-                    }
-                    return Err(e);
-                }
-                self.index.remove_tree(path);
-                self.index_stale = true;
-                if self.selected_folder.as_ref().is_some_and(|s| store::is_within(s, path)) {
-                    self.selected_folder = None;
-                    self.pages.clear();
-                }
-                self.reload_tree();
+                let entry = self.delete_section_now(path)?;
                 self.set_status(format!("Section \"{name}\" deleted; restore it from Folders > Deleted items"));
+                self.undo.push(undo::Record {
+                    step: undo::Step::Delete { path: path.clone(), entry, section: true },
+                    label: format!("deletion of \"{name}\""),
+                });
             }
             Dialog::Message { .. } => {}
         }
