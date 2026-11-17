@@ -13,6 +13,11 @@ fn parent_of(p: &Path) -> Result<PathBuf, String> {
     p.parent().map(Path::to_path_buf).ok_or_else(|| GONE.to_string())
 }
 
+/// Whether `p` lies in one of the open top-level folders.
+fn in_open_root(roots: &[PathBuf], p: &Path) -> bool {
+    roots.iter().any(|r| store::is_within(p, r))
+}
+
 impl NoteApp {
     /// Renames a page; the file is named after `stem` when given (refused when that name is taken),
     /// otherwise after `title`. The open page is saved first and reopened under the new name.
@@ -155,7 +160,7 @@ impl NoteApp {
         if !item.exists() {
             return Err(GONE.to_string());
         }
-        if !self.roots.iter().any(|r| store::is_within(place, r) && store::is_within(item, r)) {
+        if !in_open_root(&self.roots, place) || !in_open_root(&self.roots, item) {
             return Err("its folder is not open in NoteCraft".to_string());
         }
         Ok(())
@@ -231,5 +236,18 @@ impl NoteApp {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn place_and_item_may_lie_in_different_open_roots() {
+        let roots = vec![PathBuf::from(r"C:\Notes\A"), PathBuf::from(r"C:\Notes\B")];
+        assert!(in_open_root(&roots, Path::new(r"C:\Notes\A\x\p.md")));
+        assert!(in_open_root(&roots, Path::new(r"c:\notes\b\q.md")));
+        assert!(!in_open_root(&roots, Path::new(r"C:\Notes\C\q.md")));
     }
 }
