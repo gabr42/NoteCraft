@@ -124,6 +124,11 @@ pub fn file_stem(path: &Path) -> String {
     path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
 }
 
+/// The extension of a page file, without the dot (`md` when it has none).
+pub fn page_ext(path: &Path) -> String {
+    path.extension().map_or_else(|| "md".to_string(), |e| e.to_string_lossy().to_string())
+}
+
 pub fn now_stamp() -> String {
     chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
 }
@@ -449,7 +454,7 @@ pub fn save_conflict_copy(path: &Path, body: &str, computer: &str) -> Result<Pat
 pub fn rename_page(path: &Path, new_title: &str, exact: Option<&Path>) -> Result<PathBuf, String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let stem = exact.map(file_stem);
-    let ext = exact.and_then(|p| p.extension()).map_or_else(|| "md".to_string(), |e| e.to_string_lossy().to_string());
+    let ext = exact.map_or_else(|| "md".to_string(), page_ext);
     if let Some(stem) = &stem {
         let own = same_path(&dir.join(stem), &dir.join(file_stem(path)));
         let page_taken = ["md", "markdown"].iter().any(|ext| {

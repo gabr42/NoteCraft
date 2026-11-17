@@ -48,10 +48,10 @@ enum Mode {
     Edit,
 }
 
-/// The open page as `release_open_page` closed it, for `reopen`.
-/// Why `release_open_page` refuses; undo and redo keep their record on this one.
+/// Why `release_open_page` refuses (also the reason of a busy undo or redo step).
 const SAVE_FAILED: &str = "The open page could not be saved, so nothing was changed. Check the page first.";
 
+/// The open page as `release_open_page` closed it, for `reopen`.
 pub(super) struct Released {
     path: PathBuf,
     /// It was in edit mode.
@@ -970,22 +970,13 @@ impl NoteApp {
                     if ui.add(top_button("⟳")).hover_fx().on_hover_text("Reload notes from disk (F5)").clicked() {
                         self.actions.push(Action::Refresh);
                     }
+                    let blocked = self.undo_blocked();
                     let redo_label = self.undo.redo_label().map(str::to_string);
-                    let redo_btn = ui.add_enabled(redo_label.is_some(), top_button("↷")).hover_fx();
-                    let redo_btn = match &redo_label {
-                        Some(l) => redo_btn.on_hover_text(format!("Redo {l} (Ctrl+Y)")),
-                        None => redo_btn.on_disabled_hover_text("Nothing to redo"),
-                    };
-                    if redo_btn.clicked() {
+                    if undo_button(ui, "↷", "Redo", "Ctrl+Y", redo_label, blocked) {
                         self.actions.push(Action::Redo);
                     }
                     let undo_label = self.undo.undo_label().map(str::to_string);
-                    let undo_btn = ui.add_enabled(undo_label.is_some(), top_button("↶")).hover_fx();
-                    let undo_btn = match &undo_label {
-                        Some(l) => undo_btn.on_hover_text(format!("Undo {l} (Ctrl+Z)")),
-                        None => undo_btn.on_disabled_hover_text("Nothing to undo"),
-                    };
-                    if undo_btn.clicked() {
+                    if undo_button(ui, "↶", "Undo", "Ctrl+Z", undo_label, blocked) {
                         self.actions.push(Action::Undo);
                     }
                     ui.add_space(8.0);
@@ -1730,10 +1721,13 @@ impl NoteApp {
                 let old_title = store::read_doc(path).map(|d| d.title_or(path)).unwrap_or_else(|_| store::file_stem(path));
                 let new_path = self.rename_page_now(path, title, None)?;
                 self.set_status(format!("Renamed to \"{}\"", title.trim()));
-                self.undo.push(undo::Record {
-                    step: undo::Step::RenamePage { from: path.clone(), to: new_path, old_title: old_title.clone(), new_title: title.trim().to_string() },
-                    label: format!("rename of \"{old_title}\""),
-                });
+                // Confirming the unchanged title changes nothing worth an undo (and keeps the redo list).
+                if new_path != *path || title.trim() != old_title {
+                    self.undo.push(undo::Record {
+                        step: undo::Step::RenamePage { from: path.clone(), to: new_path, old_title: old_title.clone(), new_title: title.trim().to_string() },
+                        label: format!("rename of \"{old_title}\""),
+                    });
+                }
             }
             Dialog::DeletePage { path, title, .. } => {
                 let entry = self.delete_page_now(path)?;
@@ -1782,14 +1776,7 @@ impl NoteApp {
         let sc = |k: Key| KeyboardShortcut::new(Modifiers::COMMAND, k);
         // Undo/redo of note management. Text fields, the page editor and every window keep their own
         // Ctrl+Z, so the keys are consumed only when none of them is active.
-        let undo_ok = self.mode != Mode::Edit
-            && !ctx.egui_wants_keyboard_input()
-            && self.dialog.is_none()
-            && self.import_win.is_none()
-            && self.move_win.is_none()
-            && self.history_win.is_none()
-            && self.deleted_win.is_none()
-            && self.history_view.is_none();
+        let undo_ok = self.mode != Mode::Edit && !ctx.egui_wants_keyboard_input() && !self.undo_blocked();
         let (redo_shift, redo_y, undo_z, find, save, edit, new, print, refresh, esc) = ctx.input_mut(|i| {
             (
                 // Ctrl+Shift+Z first: egui matches modifiers loosely, so Ctrl+Z would also take it.
@@ -2242,6 +2229,18 @@ fn overlay_png(img: &mut image::RgbaImage, png: &[u8], bounds: [i32; 4]) {
         web = image::imageops::resize(&web, w.max(1) as u32, h.max(1) as u32, image::imageops::FilterType::Triangle);
     }
     image::imageops::overlay(img, &web, x as i64, y as i64);
+}
+
+/// The undo or redo button of the top bar; `label` is what it would take back or do again. Returns
+/// whether it was clicked.
+fn undo_button(ui: &mut egui::Ui, glyph: &str, verb: &str, key: &str, label: Option<String>, blocked: bool) -> bool {
+    let btn = ui.add_enabled(label.is_some() && !blocked, top_button(glyph)).hover_fx();
+    let btn = match label {
+        Some(_) if blocked => btn.on_disabled_hover_text(format!("Close the open window to {}", verb.to_lowercase())),
+        Some(l) => btn.on_hover_text(format!("{verb} {l} ({key})")),
+        None => btn.on_disabled_hover_text(format!("Nothing to {}", verb.to_lowercase())),
+    };
+    btn.clicked()
 }
 
 /// Refuses when another computer is editing the page or one of its subpages.

@@ -8,12 +8,37 @@ use crate::undo::{Record, Step};
 /// The reason when the item a step works on has vanished.
 const GONE: &str = "it is not there any more";
 
-/// The folder an item lies in, or the "not there" reason for a path without one.
-/// The extension of a page file, without the dot (`md` when it has none).
-fn page_ext(p: &Path) -> String {
-    p.extension().map_or_else(|| "md".to_string(), |e| e.to_string_lossy().to_string())
+/// Why a step did not run.
+#[derive(Debug, PartialEq)]
+enum StepError {
+    /// Something that can pass (another computer edits the item, the open page could not be saved):
+    /// the record stays on its list.
+    Busy(String),
+    /// The step cannot be done: the record is dropped.
+    Refused(String),
 }
 
+impl StepError {
+    fn text(&self) -> &str {
+        match self {
+            StepError::Busy(t) | StepError::Refused(t) => t,
+        }
+    }
+}
+
+impl From<String> for StepError {
+    fn from(e: String) -> Self {
+        StepError::Refused(e)
+    }
+}
+
+impl From<&str> for StepError {
+    fn from(e: &str) -> Self {
+        StepError::Refused(e.to_string())
+    }
+}
+
+/// The folder an item lies in, or the "not there" reason for a path without one.
 fn parent_of(p: &Path) -> Result<PathBuf, String> {
     p.parent().map(Path::to_path_buf).ok_or_else(|| GONE.to_string())
 }
@@ -61,7 +86,7 @@ impl NoteApp {
     /// `None`: nothing was done.
     pub(super) fn rename_section_now(&mut self, path: &Path, name: &str) -> Result<Option<PathBuf>, String> {
         let moved = self.relocate_folder(path, || {
-            store::rename_folder(path, name).map(|p| Some(mover::Moved { path: p, left_behind: Vec::new(), pictures: Vec::new() }))
+            store::rename_folder(path, name).map(|p| Some(mover::Moved { path: p, left_behind: Vec::new(), pictures: Vec::new(), kept: Vec::new() }))
         })?;
         Ok(moved.map(|m| m.path))
     }
@@ -120,24 +145,41 @@ impl NoteApp {
         Ok(entry)
     }
 
-    /// Takes back the newest action.
+    /// Takes back the newest action. Ignored while a window is open (`undo_blocked`).
     pub(super) fn undo(&mut self) {
+        if self.undo_blocked() {
+            return;
+        }
         match self.undo.take_undo() {
             Some(rec) => self.run_step(rec, true),
             None => self.set_status("Nothing to undo".to_string()),
         }
     }
 
-    /// Does the newest undone action again.
+    /// Does the newest undone action again. Ignored while a window is open (`undo_blocked`).
     pub(super) fn redo(&mut self) {
+        if self.undo_blocked() {
+            return;
+        }
         match self.undo.take_redo() {
             Some(rec) => self.run_step(rec, false),
             None => self.set_status("Nothing to redo".to_string()),
         }
     }
 
+    /// Whether a window or dialog is open that undo and redo must not change things behind (its
+    /// content would be out of date).
+    pub(super) fn undo_blocked(&self) -> bool {
+        self.dialog.is_some()
+            || self.import_win.is_some()
+            || self.move_win.is_some()
+            || self.history_win.is_some()
+            || self.deleted_win.is_some()
+            || self.history_view.is_some()
+    }
+
     /// Runs `rec` backwards (`undoing`) or forwards. On success it moves to the other list; when it
-    /// is refused it is dropped, except when the open page could not be saved: then it goes back.
+    /// is refused it is dropped, when it is only busy it goes back.
     fn run_step(&mut self, mut rec: Record, undoing: bool) {
         let (verb, done) = if undoing { ("undo", "Undone") } else { ("redo", "Redone") };
         match self.apply_step(&mut rec.step, undoing) {
@@ -149,10 +191,10 @@ impl NoteApp {
                 if undoing { self.undo.undone(rec) } else { self.undo.redone(rec) }
             }
             Err(e) => {
-                let text = format!("Cannot {verb} {}: {e}", rec.label);
+                let text = format!("Cannot {verb} {}: {}", rec.label, e.text());
                 self.set_status(text.clone());
                 let sentence = if text.ends_with('.') { text.clone() } else { format!("{text}.") };
-                if e == SAVE_FAILED {
+                if matches!(e, StepError::Busy(_)) {
                     if undoing { self.undo.return_undo(rec) } else { self.undo.return_redo(rec) }
                     self.show_message(&format!("Cannot {verb}"), sentence);
                 } else {
@@ -173,6 +215,19 @@ impl NoteApp {
         Ok(())
     }
 
+    /// The third check, on an item that is there: nobody else edits it, and the open page, when it
+    /// lies in it, is saved. Both can pass, so they fail as `Busy`; the operation repeats them.
+    fn check_free(&mut self, item: &Path, section: bool) -> Result<(), StepError> {
+        let free = if section { folder_free(item) } else { page_free(item) };
+        free.map_err(StepError::Busy)?;
+        let sub = store::subpage_dir(item);
+        let inside = |p: &Path| if section { store::is_within(p, item) } else { store::same_path(p, item) || store::is_within(p, &sub) };
+        if self.page.as_ref().is_some_and(|p| inside(&p.path)) && !self.save_if_dirty() {
+            return Err(StepError::Busy(SAVE_FAILED.to_string()));
+        }
+        Ok(())
+    }
+
     /// Brings a deleted item back to exactly its old name. Returns what to show in the tree.
     fn restore_exact(&mut self, entry: &Path, place: &Path) -> Result<Option<PathBuf>, String> {
         self.check_step(entry, place)?;
@@ -183,25 +238,32 @@ impl NoteApp {
     }
 
     /// Deletes an item again; returns the new `deleted` entry.
-    fn delete_again(&mut self, path: &Path, section: bool) -> Result<PathBuf, String> {
+    fn delete_again(&mut self, path: &Path, section: bool) -> Result<PathBuf, StepError> {
         self.check_step(path, &parent_of(path)?)?;
-        if section { self.delete_section_now(path) } else { self.delete_page_now(path) }
+        self.check_free(path, section)?;
+        Ok(if section { self.delete_section_now(path)? } else { self.delete_page_now(path)? })
     }
 
     /// Does one step in one direction: the checks in their order (item there, folder open, nobody
     /// editing, exact names), then the operation. Returns what to make visible in the tree.
-    fn apply_step(&mut self, step: &mut Step, undoing: bool) -> Result<Option<PathBuf>, String> {
+    fn apply_step(&mut self, step: &mut Step, undoing: bool) -> Result<Option<PathBuf>, StepError> {
         match &mut *step {
-            Step::MovePage { from, to, pictures } => {
+            Step::MovePage { from, to, pictures, kept } => {
                 let (item, dest) = if undoing { (to.clone(), from.clone()) } else { (from.clone(), to.clone()) };
                 let target = parent_of(&dest)?;
                 self.check_step(&item, &target)?;
+                self.check_free(&item, false)?;
                 let exact = mover::Exact {
                     stem: store::file_stem(&dest),
-                    ext: page_ext(&dest),
+                    ext: store::page_ext(&dest),
                     pictures: if undoing { undo::invert(pictures) } else { pictures.clone() },
+                    // The pictures that were in the target before the move stay there on undo.
+                    keep: if undoing { kept.clone() } else { Vec::new() },
                 };
                 let moved = self.do_move(&item, &target, Some(&exact))?.ok_or("it cannot be moved there")?;
+                if !undoing {
+                    *kept = moved.kept.clone();
+                }
                 step.set_result(undoing, &moved.path);
                 Ok(Some(target))
             }
@@ -209,6 +271,7 @@ impl NoteApp {
                 let (item, dest) = if undoing { (to.clone(), from.clone()) } else { (from.clone(), to.clone()) };
                 let target = parent_of(&dest)?;
                 self.check_step(&item, &target)?;
+                self.check_free(&item, true)?;
                 let moved = self.do_move_section(&item, &target, Some(&folder_name(&dest)))?.ok_or("it cannot be moved there")?;
                 step.set_result(undoing, &moved.path);
                 Ok(Some(moved.path))
@@ -217,6 +280,7 @@ impl NoteApp {
                 let (item, dest, title) = if undoing { (to.clone(), from.clone(), old_title.clone()) } else { (from.clone(), to.clone(), new_title.clone()) };
                 let place = parent_of(&item)?;
                 self.check_step(&item, &place)?;
+                self.check_free(&item, false)?;
                 let new = self.rename_page_now(&item, &title, Some(&dest))?;
                 step.set_result(undoing, &new);
                 Ok(Some(place))
@@ -224,13 +288,14 @@ impl NoteApp {
             Step::RenameSection { from, to } => {
                 let (item, dest) = if undoing { (to.clone(), from.clone()) } else { (from.clone(), to.clone()) };
                 self.check_step(&item, &parent_of(&item)?)?;
+                self.check_free(&item, true)?;
                 let new = self.rename_section_now(&item, &folder_name(&dest))?.ok_or("it cannot be renamed")?;
                 step.set_result(undoing, &new);
                 Ok(Some(new))
             }
             Step::Delete { path, entry, section } => {
                 if undoing {
-                    self.restore_exact(entry, &parent_of(path)?)
+                    Ok(self.restore_exact(entry, &parent_of(path)?)?)
                 } else {
                     *entry = self.delete_again(path, *section)?;
                     Ok(Some(parent_of(path)?))
@@ -241,8 +306,8 @@ impl NoteApp {
                     *entry = Some(self.delete_again(path, *section)?);
                     Ok(Some(parent_of(path)?))
                 } else {
-                    let e = entry.clone().ok_or_else(|| GONE.to_string())?;
-                    self.restore_exact(&e, &parent_of(path)?)
+                    let e = entry.clone().ok_or(GONE)?;
+                    Ok(self.restore_exact(&e, &parent_of(path)?)?)
                 }
             }
         }

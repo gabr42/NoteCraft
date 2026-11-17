@@ -227,16 +227,10 @@ impl NoteApp {
         }
         self.set_status(format!("Moved \"{title}\" to {}", self.index.place_of(&new)));
         if !moved.left_behind.is_empty() {
-            let mut text = left_behind_text(&format!("The page \"{title}\""), &moved.left_behind);
-            if exact.is_none() {
-                text.push_str("
-
-This move cannot be undone.");
-            }
-            self.show_message("Move page", text);
+            self.show_message("Move page", left_behind_text(&format!("The page \"{title}\""), &moved.left_behind, exact.is_none()));
         } else if exact.is_none() {
             self.undo.push(undo::Record {
-                step: undo::Step::MovePage { from: page.to_path_buf(), to: new, pictures: moved.pictures.clone() },
+                step: undo::Step::MovePage { from: page.to_path_buf(), to: new, pictures: moved.pictures.clone(), kept: moved.kept.clone() },
                 label: format!("move of \"{title}\""),
             });
         }
@@ -258,13 +252,8 @@ This move cannot be undone.");
         // `new` carries the final name ("Name (2)" after a name clash).
         self.set_status(format!("Moved section \"{}\" to {}", folder_name(&new), self.index.place_of(&new)));
         if !moved.left_behind.is_empty() {
-            let mut text = left_behind_text(&format!("The section \"{}\"", folder_name(&new)), &moved.left_behind);
-            if name.is_none() {
-                text.push_str("
-
-This move cannot be undone.");
-            }
-            self.show_message("Move section", text);
+            let what = format!("The section \"{}\"", folder_name(&new));
+            self.show_message("Move section", left_behind_text(&what, &moved.left_behind, name.is_none()));
         } else if name.is_none() {
             self.undo.push(undo::Record {
                 step: undo::Step::MoveSection { from: folder.to_path_buf(), to: new },
@@ -383,7 +372,8 @@ This move cannot be undone.");
 }
 
 /// The message after a move whose copy is complete but whose originals were not all removed.
-fn left_behind_text(what: &str, left: &[PathBuf]) -> String {
+/// `user_move`: the user's own move (not an undo or redo), which is then not recorded for undo.
+fn left_behind_text(what: &str, left: &[PathBuf], user_move: bool) -> String {
     const SHOWN: usize = 10;
     let mut text = format!(
         "{what} was moved, but these files could not be removed from the old place. They are \
@@ -394,6 +384,9 @@ fn left_behind_text(what: &str, left: &[PathBuf]) -> String {
     }
     if left.len() > SHOWN {
         text.push_str(&format!("\n… and {} more", left.len() - SHOWN));
+    }
+    if user_move {
+        text.push_str("\n\nThis move cannot be undone.");
     }
     text
 }

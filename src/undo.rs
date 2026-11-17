@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 pub const DEPTH: usize = 20;
 
 pub enum Step {
-    MovePage { from: PathBuf, to: PathBuf, pictures: Vec<(String, String)> },
+    /// `pictures`: the renames the move made, (source name, target name). `kept`: target names of
+    /// pictures that were already in the target, which the undo leaves there.
+    MovePage { from: PathBuf, to: PathBuf, pictures: Vec<(String, String)>, kept: Vec<String> },
     MoveSection { from: PathBuf, to: PathBuf },
     RenamePage { from: PathBuf, to: PathBuf, old_title: String, new_title: String },
     RenameSection { from: PathBuf, to: PathBuf },

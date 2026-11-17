@@ -96,18 +96,26 @@ pub(crate) fn rewrite_picture_links(text: &str, renames: &[(String, String)]) ->
     .into_owned()
 }
 
-/// The first of `stem`, `stem (2)`, `stem (3)` … that is free in `dir` as a page, as a subpage
-/// folder and as a versions folder.
+/// The first of `stem`, `stem (2)`, `stem (3)` … that is free in `dir` as a page (`.md` or
+/// `.markdown`), as a subpage folder and as a versions folder.
 pub(crate) fn free_stem(dir: &Path, stem: &str) -> String {
     let mut n = 1;
     loop {
         let s = if n == 1 { stem.to_string() } else { format!("{stem} ({n})") };
         let page = dir.join(format!("{s}.md"));
-        if !page.exists() && !dir.join(&s).exists() && !crate::history::versions_dir(&page).exists() {
+        let taken = ["md", "markdown"].iter().any(|e| dir.join(format!("{s}.{e}")).exists())
+            || dir.join(&s).exists()
+            || crate::history::versions_dir(&page).exists();
+        if !taken {
             return s;
         }
         n += 1;
     }
+}
+
+/// The name of a folder as messages show it (the whole path for a drive root).
+fn display_name(dir: &Path) -> String {
+    dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().to_string())
 }
 
 fn drive_of(p: &Path) -> String {
@@ -124,6 +132,9 @@ pub struct Moved {
     pub left_behind: Vec<PathBuf>,
     /// The picture renames this move made, (source name, target name); empty for sections.
     pub pictures: Vec<(String, String)>,
+    /// Target names of the pictures that were already in the target with the same bytes, so nothing
+    /// was copied; the undo must not remove them from there. Empty for sections.
+    pub kept: Vec<String>,
 }
 
 /// Names an exact move must give (undo/redo). `pictures`: (name linked in the page now, name it must
@@ -133,6 +144,9 @@ pub struct Exact {
     /// Extension of the page file, without the dot (`md`, or `markdown` for a page that had it).
     pub ext: String,
     pub pictures: Vec<(String, String)>,
+    /// Pictures (names linked in the page now) that stay in the source folder: they were there before
+    /// the move this one takes back.
+    pub keep: Vec<String>,
 }
 
 /// Removes `p` and everything below it as far as possible, also read-only files, and adds what is
@@ -307,10 +321,10 @@ pub fn move_page(page: &Path, target_dir: &Path, exact: Option<&Exact>) -> Resul
     if !can_move_to(page, target_dir) {
         return Err("A page cannot be moved under itself.".into());
     }
-    let target_name = target_dir.file_name().map_or_else(|| target_dir.display().to_string(), |n| n.to_string_lossy().to_string());
+    let target_name = display_name(target_dir);
     let stem = match exact {
         Some(e) => {
-            if free_stem(target_dir, &e.stem) != e.stem || target_dir.join(format!("{}.{}", e.stem, e.ext)).exists() {
+            if free_stem(target_dir, &e.stem) != e.stem {
                 return Err(format!("\"{target_name}\" already has a page named \"{}\".", e.stem));
             }
             e.stem.clone()
@@ -369,7 +383,10 @@ pub fn move_page(page: &Path, target_dir: &Path, exact: Option<&Exact>) -> Resul
             .map_err(|e| format!("Could not copy the picture {n} to {}: {e}", dst_res.display()))?;
     }
     let renames: Vec<(String, String)> = plan.iter().filter(|(n, t, _)| n != t).map(|(n, t, _)| (n.clone(), t.clone())).collect();
-    let copied: Vec<String> = plan.into_iter().map(|(n, _, _)| n).collect();
+    let kept: Vec<String> = plan.iter().filter(|(_, _, copy)| !copy).map(|(_, t, _)| t.clone()).collect();
+    let keep: &[String] = exact.map_or(&[], |e| e.keep.as_slice());
+    // The originals to remove once the page is moved.
+    let copied: Vec<String> = plan.into_iter().map(|(n, _, _)| n).filter(|n| !keep.iter().any(|k| same_name(k, n))).collect();
 
     // 2. Move the page, its subpages and its versions; undo on failure.
     let mut moves = vec![(page.to_path_buf(), new.clone())];
@@ -414,7 +431,7 @@ pub fn move_page(page: &Path, target_dir: &Path, exact: Option<&Exact>) -> Resul
         }
     }
     remove_if_empty_subpage_folder(src_dir);
-    Ok(Some(Moved { path: new, left_behind, pictures: renames }))
+    Ok(Some(Moved { path: new, left_behind, pictures: renames, kept }))
 }
 
 /// Moves `done` (pairs of from, to) back in reverse order after the move that failed with `error`.
@@ -460,15 +477,14 @@ pub fn move_section(folder: &Path, target: &Path, name: Option<&str>) -> Result<
     let new = match name {
         Some(n) => {
             if free_stem(target, n) != n {
-                let target_name = target.file_name().map_or_else(|| target.display().to_string(), |t| t.to_string_lossy().to_string());
-                return Err(format!("\"{target_name}\" already has a section named \"{n}\"."));
+                return Err(format!("\"{}\" already has a section named \"{n}\".", display_name(target)));
             }
             target.join(n)
         }
         None => target.join(free_stem(target, &own)),
     };
     let left_behind = move_path(folder, &new)?;
-    Ok(Some(Moved { path: new, left_behind, pictures: Vec::new() }))
+    Ok(Some(Moved { path: new, left_behind, pictures: Vec::new(), kept: Vec::new() }))
 }
 
 /// Moves a file or folder; across drives by copying and removing the original. Returns what of the
@@ -835,7 +851,7 @@ mod tests {
         pic(&a, "x.png", b"MINE");
         pic(&b, "x.png", b"THEIRS");
         let new = move_page(&p, &b, None).unwrap().unwrap().path;
-        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: vec![("x-2.png".into(), "x.png".into())] };
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: vec![("x-2.png".into(), "x.png".into())], keep: Vec::new() };
         let back = move_page(&new, &a, Some(&exact)).unwrap().unwrap();
         assert_eq!(back.path, a.join("P.md"));
         assert!(fs::read_to_string(&back.path).unwrap().contains("](resources/x.png)"));
@@ -854,7 +870,7 @@ mod tests {
         page_with(&b, "P", "other");
         let new = move_page(&p, &b, None).unwrap().unwrap().path;
         assert_eq!(new, b.join("P (2).md"));
-        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: Vec::new() };
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: Vec::new(), keep: Vec::new() };
         let back = move_page(&new, &a, Some(&exact)).unwrap().unwrap();
         assert_eq!(back.path, a.join("P.md"));
         let _ = fs::remove_dir_all(&d);
@@ -878,7 +894,7 @@ mod tests {
         assert_eq!(fs::read(res.join("x-2.png")).unwrap(), b"MINE");
         assert_eq!(fs::read(res.join("x-2-2.png")).unwrap(), b"MINE2");
         // Undo: the exact move back gives the original names.
-        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: crate::undo::invert(&moved.pictures) };
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: crate::undo::invert(&moved.pictures), keep: Vec::new() };
         let back = move_page(&moved.path, &a, Some(&exact)).unwrap().unwrap();
         let text = fs::read_to_string(&back.path).unwrap();
         assert_eq!(picture_links(&text), vec!["x.png".to_string(), "x-2.png".to_string()], "{text}");
@@ -899,10 +915,40 @@ text
 ").unwrap();
         let new = move_page(&p, &b, None).unwrap().unwrap().path;
         assert_eq!(new, b.join("X.md"));
-        let exact = Exact { stem: "X".into(), ext: "markdown".into(), pictures: Vec::new() };
+        let exact = Exact { stem: "X".into(), ext: "markdown".into(), pictures: Vec::new(), keep: Vec::new() };
         let back = move_page(&new, &a, Some(&exact)).unwrap().unwrap();
         assert_eq!(back.path, a.join("X.markdown"));
         assert!(back.path.is_file() && !a.join("X.md").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn markdown_page_takes_the_stem() {
+        let (d, a, b) = notebook("md-stem");
+        let p = page_with(&a, "P", "text");
+        fs::write(b.join("P.markdown"), "---\ntitle: P\n---\n\nother\n").unwrap();
+        assert_eq!(free_stem(&b, "P"), "P (2)");
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: Vec::new(), keep: Vec::new() };
+        let err = move_page(&p, &b, Some(&exact)).err().unwrap();
+        assert!(err.contains("already has a page named \"P\""), "{err}");
+        assert_eq!(move_page(&p, &b, None).unwrap().unwrap().path, b.join("P (2).md"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn undo_keeps_picture_that_was_there_before() {
+        let (d, a, b) = notebook("kept-pic");
+        let p = page_with(&a, "P", "![](resources/x.png)");
+        pic(&a, "x.png", b"SAME");
+        pic(&b, "x.png", b"SAME");
+        let moved = move_page(&p, &b, None).unwrap().unwrap();
+        assert_eq!(moved.kept, vec!["x.png".to_string()]);
+        assert!(!a.join("resources").join("x.png").exists());
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: Vec::new(), keep: moved.kept.clone() };
+        let back = move_page(&moved.path, &a, Some(&exact)).unwrap().unwrap();
+        assert_eq!(back.path, a.join("P.md"));
+        assert_eq!(fs::read(a.join("resources").join("x.png")).unwrap(), b"SAME");
+        assert_eq!(fs::read(b.join("resources").join("x.png")).unwrap(), b"SAME");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -920,7 +966,7 @@ text
         pic(&a, "x.png", b"MINE");
         page_with(&b, "P", "other");
         let (before_a, before_b) = (listing(&a), listing(&b));
-        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: Vec::new() };
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: Vec::new(), keep: Vec::new() };
         let err = move_page(&p, &b, Some(&exact)).err().unwrap();
         assert!(err.contains("already has a page named \"P\""), "{err}");
         assert_eq!((listing(&a), listing(&b)), (before_a, before_b));
@@ -935,7 +981,7 @@ text
         pic(&a, "x-2.png", b"MINE");
         pic(&b, "x.png", b"THEIRS");
         let (before_a, before_b) = (listing(&a), listing(&b));
-        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: vec![("x-2.png".into(), "x.png".into())] };
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: vec![("x-2.png".into(), "x.png".into())], keep: Vec::new() };
         let err = move_page(&p, &b, Some(&exact)).err().unwrap();
         assert!(err.contains("already has a different picture named \"x.png\""), "{err}");
         assert_eq!((listing(&a), listing(&b)), (before_a, before_b));
