@@ -331,7 +331,7 @@ impl NoteApp {
     }
 
     /// Updates the index, the tree and the page list after a deleted item came back.
-    fn after_restore_deleted(&mut self, item: &history::DeletedItem, path: &Path) -> String {
+    pub(super) fn after_restore_deleted(&mut self, item: &history::DeletedItem, path: &Path) -> String {
         match item.kind {
             history::ItemKind::Page => {
                 self.index.add(path);
@@ -353,13 +353,13 @@ impl NoteApp {
     /// Restores the deleted item kept in a `deleted\<time>` folder (from a search hit).
     fn restore_deleted_entry(&mut self, entry: &Path) -> Result<String, String> {
         let item = history::deleted_item_at(entry).ok_or_else(|| "The deleted item is not there any more.".to_string())?;
-        let path = history::restore_deleted(&item)?;
+        let path = history::restore_deleted(&item, false)?;
         Ok(self.after_restore_deleted(&item, &path))
     }
 
     fn restore_deleted_now(&mut self, win: &mut DeletedWin, i: usize) {
         let Some(item) = win.items.get(i).cloned() else { return };
-        match history::restore_deleted(&item) {
+        match history::restore_deleted(&item, false) {
             Ok(path) => {
                 let msg = self.after_restore_deleted(&item, &path);
                 win.message = msg;

@@ -7,6 +7,7 @@ mod mover;
 mod onenote;
 mod render;
 mod store;
+mod undo;
 mod web;
 
 use std::path::PathBuf;

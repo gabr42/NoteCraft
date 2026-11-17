@@ -180,16 +180,18 @@ impl NoteApp {
     }
 
     /// Moves `page` into `target_dir`; the open page is saved first and reopened at its new place.
-    pub(super) fn do_move(&mut self, page: &Path, target_dir: &Path) -> Result<(), String> {
+    /// With `exact` (undo/redo) the page gets exactly that name or the move is refused, and nothing is
+    /// recorded; otherwise a move that left nothing behind is recorded for undo. `Ok(None)`: nothing to do.
+    pub(super) fn do_move(&mut self, page: &Path, target_dir: &Path, exact: Option<&mover::Exact>) -> Result<Option<mover::Moved>, String> {
         if !mover::can_move_to(page, target_dir) {
-            return Ok(());
+            return Ok(None);
         }
         page_free(page)?;
         let sub = store::subpage_dir(page);
         // The open page, when it moves along (the page itself or one of its subpages).
         let open = self.release_open_page(|p| store::same_path(p, page) || store::is_within(p, &sub))?;
         let title = store::read_doc(page).map(|d| d.title_or(page)).unwrap_or_else(|_| store::file_stem(page));
-        let mover::Moved { path: new, left_behind } = match mover::move_page(page, target_dir) {
+        let moved = match mover::move_page(page, target_dir, exact) {
             Ok(Some(moved)) => moved,
             other => {
                 if other.is_err() {
@@ -200,9 +202,10 @@ impl NoteApp {
                 if let Some(r) = &open {
                     self.reopen(r, &r.path.clone());
                 }
-                return other.map(|_| ());
+                return other;
             }
         };
+        let new = moved.path.clone();
         // The page itself is read again (a name clash renames it, which can change its title);
         // its subpages only change place.
         self.index.remove(page);
@@ -223,28 +226,41 @@ impl NoteApp {
             self.reopen(r, &reopened);
         }
         self.set_status(format!("Moved \"{title}\" to {}", self.index.place_of(&new)));
-        if !left_behind.is_empty() {
-            let text = left_behind_text(&format!("The page \"{title}\""), &left_behind);
-            self.show_message("Move page", text);
+        if !moved.left_behind.is_empty() {
+            self.show_message("Move page", left_behind_text(&format!("The page \"{title}\""), &moved.left_behind, exact.is_none()));
+        } else if exact.is_none() {
+            self.undo.push(undo::Record {
+                step: undo::Step::MovePage { from: page.to_path_buf(), to: new, pictures: moved.pictures.clone(), kept: moved.kept.clone() },
+                label: format!("move of \"{title}\""),
+            });
         }
-        Ok(())
+        Ok(Some(moved))
     }
 
     /// Moves the section `folder` into `target`; the open page inside it is saved first and reopened.
-    pub(super) fn do_move_section(&mut self, folder: &Path, target: &Path) -> Result<(), String> {
+    /// With `name` (undo/redo) the section gets exactly that name or the move is refused, and nothing is
+    /// recorded; otherwise a move that left nothing behind is recorded for undo.
+    pub(super) fn do_move_section(&mut self, folder: &Path, target: &Path, name: Option<&str>) -> Result<Option<mover::Moved>, String> {
         if !mover::can_move_section_to(folder, target) {
-            return Ok(());
+            return Ok(None);
         }
-        let Some(mover::Moved { path: new, left_behind }) = self.relocate_folder(folder, || mover::move_section(folder, target))? else {
-            return Ok(());
+        let old_name = folder_name(folder);
+        let Some(moved) = self.relocate_folder(folder, || mover::move_section(folder, target, name))? else {
+            return Ok(None);
         };
+        let new = moved.path.clone();
         // `new` carries the final name ("Name (2)" after a name clash).
         self.set_status(format!("Moved section \"{}\" to {}", folder_name(&new), self.index.place_of(&new)));
-        if !left_behind.is_empty() {
-            let text = left_behind_text(&format!("The section \"{}\"", folder_name(&new)), &left_behind);
-            self.show_message("Move section", text);
+        if !moved.left_behind.is_empty() {
+            let what = format!("The section \"{}\"", folder_name(&new));
+            self.show_message("Move section", left_behind_text(&what, &moved.left_behind, name.is_none()));
+        } else if name.is_none() {
+            self.undo.push(undo::Record {
+                step: undo::Step::MoveSection { from: folder.to_path_buf(), to: new },
+                label: format!("move of \"{old_name}\""),
+            });
         }
-        Ok(())
+        Ok(Some(moved))
     }
 
     fn move_folder_rows(&self, ui: &mut egui::Ui, win: &mut MoveDialog, f: &Folder, depth: usize) {
@@ -343,8 +359,8 @@ impl NoteApp {
         }
         if confirm && let Some(target) = win.selected.clone() {
             let result = match win.kind {
-                MoveKind::Page => self.do_move(&win.item, &target),
-                MoveKind::Section => self.do_move_section(&win.item, &target),
+                MoveKind::Page => self.do_move(&win.item, &target, None).map(|_| ()),
+                MoveKind::Section => self.do_move_section(&win.item, &target, None).map(|_| ()),
             };
             match result {
                 Ok(()) => return,
@@ -356,7 +372,8 @@ impl NoteApp {
 }
 
 /// The message after a move whose copy is complete but whose originals were not all removed.
-fn left_behind_text(what: &str, left: &[PathBuf]) -> String {
+/// `user_move`: the user's own move (not an undo or redo), which is then not recorded for undo.
+fn left_behind_text(what: &str, left: &[PathBuf], user_move: bool) -> String {
     const SHOWN: usize = 10;
     let mut text = format!(
         "{what} was moved, but these files could not be removed from the old place. They are \
@@ -367,6 +384,9 @@ fn left_behind_text(what: &str, left: &[PathBuf]) -> String {
     }
     if left.len() > SHOWN {
         text.push_str(&format!("\n… and {} more", left.len() - SHOWN));
+    }
+    if user_move {
+        text.push_str("\n\nThis move cannot be undone.");
     }
     text
 }
