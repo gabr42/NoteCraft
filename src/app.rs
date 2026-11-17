@@ -990,7 +990,6 @@ impl NoteApp {
                         self.actions.push(Action::Undo);
                     }
                     ui.add_space(8.0);
-                    ui.add_space(8.0);
                     ui.scope(|ui| {
                         ui.visuals_mut().override_text_color = Some(Color32::WHITE);
                         ui.checkbox(&mut self.include_history, "Include history")
