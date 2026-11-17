@@ -189,7 +189,7 @@ impl NoteApp {
         // The open page, when it moves along (the page itself or one of its subpages).
         let open = self.release_open_page(|p| store::same_path(p, page) || store::is_within(p, &sub))?;
         let title = store::read_doc(page).map(|d| d.title_or(page)).unwrap_or_else(|_| store::file_stem(page));
-        let mover::Moved { path: new, left_behind } = match mover::move_page(page, target_dir) {
+        let mover::Moved { path: new, left_behind, .. } = match mover::move_page(page, target_dir, None) {
             Ok(Some(moved)) => moved,
             other => {
                 if other.is_err() {
@@ -235,7 +235,7 @@ impl NoteApp {
         if !mover::can_move_section_to(folder, target) {
             return Ok(());
         }
-        let Some(mover::Moved { path: new, left_behind }) = self.relocate_folder(folder, || mover::move_section(folder, target))? else {
+        let Some(mover::Moved { path: new, left_behind, .. }) = self.relocate_folder(folder, || mover::move_section(folder, target, None))? else {
             return Ok(());
         };
         // `new` carries the final name ("Name (2)" after a name clash).

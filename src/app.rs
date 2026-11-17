@@ -1740,7 +1740,7 @@ impl NoteApp {
             Dialog::RenameSection { path, name } => {
                 need(name)?;
                 self.relocate_folder(path, || {
-                    store::rename_folder(path, name).map(|p| Some(mover::Moved { path: p, left_behind: Vec::new() }))
+                    store::rename_folder(path, name).map(|p| Some(mover::Moved { path: p, left_behind: Vec::new(), pictures: Vec::new() }))
                 })?;
                 self.set_status(format!("Section renamed to \"{}\"", name.trim()));
             }
