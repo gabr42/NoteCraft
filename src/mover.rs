@@ -70,13 +70,22 @@ pub(crate) fn encode_name(name: &str) -> String {
     s
 }
 
-/// Points every link to the picture `old` at `new` instead.
+/// Points every link to the picture `old` at `new` instead (a shorthand for tests).
+#[cfg(test)]
 pub(crate) fn rewrite_picture_link(text: &str, old: &str, new: &str) -> String {
+    rewrite_picture_links(text, &[(old.to_string(), new.to_string())])
+}
+
+/// Renames pictures in all links in one pass: each link is looked up once in `renames` (old name,
+/// new name), so a new name that is also the old name of a later pair is not renamed again.
+pub(crate) fn rewrite_picture_links(text: &str, renames: &[(String, String)]) -> String {
     LINK.replace_all(text, |c: &regex::Captures| {
         let (prefix, name, angle) = link_parts(c);
-        if !same_name(&decode(name), old) {
-            c[0].to_string()
-        } else if angle && !name.contains('%') {
+        let decoded = decode(name);
+        let Some((_, new)) = renames.iter().find(|(o, _)| same_name(&decoded, o)) else {
+            return c[0].to_string();
+        };
+        if angle && !name.contains('%') {
             format!("{prefix}resources/{}>", new.replace('<', "%3C").replace('>', "%3E"))
         } else if angle {
             format!("{prefix}resources/{}>", encode_name(new))
@@ -121,6 +130,8 @@ pub struct Moved {
 /// get in the target `resources`); a linked picture not listed keeps its name.
 pub struct Exact {
     pub stem: String,
+    /// Extension of the page file, without the dot (`md`, or `markdown` for a page that had it).
+    pub ext: String,
     pub pictures: Vec<(String, String)>,
 }
 
@@ -299,14 +310,15 @@ pub fn move_page(page: &Path, target_dir: &Path, exact: Option<&Exact>) -> Resul
     let target_name = target_dir.file_name().map_or_else(|| target_dir.display().to_string(), |n| n.to_string_lossy().to_string());
     let stem = match exact {
         Some(e) => {
-            if free_stem(target_dir, &e.stem) != e.stem {
+            if free_stem(target_dir, &e.stem) != e.stem || target_dir.join(format!("{}.{}", e.stem, e.ext)).exists() {
                 return Err(format!("\"{target_name}\" already has a page named \"{}\".", e.stem));
             }
             e.stem.clone()
         }
         None => free_stem(target_dir, &file_stem(page)),
     };
-    let new = target_dir.join(format!("{stem}.md"));
+    let ext = exact.map_or("md", |e| e.ext.as_str());
+    let new = target_dir.join(format!("{stem}.{ext}"));
 
     // 1. Plan the pictures the page and its versions link (all exact checks happen here), then copy them.
     let versions = versions_dir(page);
@@ -382,10 +394,7 @@ pub fn move_page(page: &Path, target_dir: &Path, exact: Option<&Exact>) -> Resul
     if !renames.is_empty() {
         for f in std::iter::once(new.clone()).chain(files_under(&versions_dir(&new))) {
             if let Ok(text) = fs::read_to_string(&f) {
-                let mut t = text.clone();
-                for (o, n) in &renames {
-                    t = rewrite_picture_link(&t, o, n);
-                }
+                let t = rewrite_picture_links(&text, &renames);
                 if t != text {
                     let _ = fs::write(&f, t);
                 }
@@ -826,7 +835,7 @@ mod tests {
         pic(&a, "x.png", b"MINE");
         pic(&b, "x.png", b"THEIRS");
         let new = move_page(&p, &b, None).unwrap().unwrap().path;
-        let exact = Exact { stem: "P".into(), pictures: vec![("x-2.png".into(), "x.png".into())] };
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: vec![("x-2.png".into(), "x.png".into())] };
         let back = move_page(&new, &a, Some(&exact)).unwrap().unwrap();
         assert_eq!(back.path, a.join("P.md"));
         assert!(fs::read_to_string(&back.path).unwrap().contains("](resources/x.png)"));
@@ -845,9 +854,55 @@ mod tests {
         page_with(&b, "P", "other");
         let new = move_page(&p, &b, None).unwrap().unwrap().path;
         assert_eq!(new, b.join("P (2).md"));
-        let exact = Exact { stem: "P".into(), pictures: Vec::new() };
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: Vec::new() };
         let back = move_page(&new, &a, Some(&exact)).unwrap().unwrap();
         assert_eq!(back.path, a.join("P.md"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn chained_clash_renames_rewrite_once() {
+        let (d, a, b) = notebook("chain");
+        let p = page_with(&a, "P", "![](resources/x.png) ![](resources/x-2.png)");
+        version_of(&p, "old ![](resources/x.png) ![](resources/x-2.png)");
+        pic(&a, "x.png", b"MINE");
+        pic(&a, "x-2.png", b"MINE2");
+        pic(&b, "x.png", b"THEIRS");
+        let moved = move_page(&p, &b, None).unwrap().unwrap();
+        let text = fs::read_to_string(&moved.path).unwrap();
+        assert_eq!(picture_links(&text), vec!["x-2.png".to_string(), "x-2-2.png".to_string()], "{text}");
+        let v = &crate::history::list_versions(&moved.path)[0];
+        assert_eq!(picture_links(&fs::read_to_string(&v.path).unwrap()), vec!["x-2.png".to_string(), "x-2-2.png".to_string()]);
+        let res = b.join("resources");
+        assert_eq!(fs::read(res.join("x.png")).unwrap(), b"THEIRS");
+        assert_eq!(fs::read(res.join("x-2.png")).unwrap(), b"MINE");
+        assert_eq!(fs::read(res.join("x-2-2.png")).unwrap(), b"MINE2");
+        // Undo: the exact move back gives the original names.
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: crate::undo::invert(&moved.pictures) };
+        let back = move_page(&moved.path, &a, Some(&exact)).unwrap().unwrap();
+        let text = fs::read_to_string(&back.path).unwrap();
+        assert_eq!(picture_links(&text), vec!["x.png".to_string(), "x-2.png".to_string()], "{text}");
+        assert_eq!(fs::read(a.join("resources").join("x.png")).unwrap(), b"MINE");
+        assert_eq!(fs::read(a.join("resources").join("x-2.png")).unwrap(), b"MINE2");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn exact_move_keeps_markdown_extension() {
+        let (d, a, b) = notebook("exact-markdown");
+        let p = a.join("X.markdown");
+        fs::write(&p, "---
+title: X
+---
+
+text
+").unwrap();
+        let new = move_page(&p, &b, None).unwrap().unwrap().path;
+        assert_eq!(new, b.join("X.md"));
+        let exact = Exact { stem: "X".into(), ext: "markdown".into(), pictures: Vec::new() };
+        let back = move_page(&new, &a, Some(&exact)).unwrap().unwrap();
+        assert_eq!(back.path, a.join("X.markdown"));
+        assert!(back.path.is_file() && !a.join("X.md").exists());
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -865,7 +920,7 @@ mod tests {
         pic(&a, "x.png", b"MINE");
         page_with(&b, "P", "other");
         let (before_a, before_b) = (listing(&a), listing(&b));
-        let exact = Exact { stem: "P".into(), pictures: Vec::new() };
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: Vec::new() };
         let err = move_page(&p, &b, Some(&exact)).err().unwrap();
         assert!(err.contains("already has a page named \"P\""), "{err}");
         assert_eq!((listing(&a), listing(&b)), (before_a, before_b));
@@ -880,7 +935,7 @@ mod tests {
         pic(&a, "x-2.png", b"MINE");
         pic(&b, "x.png", b"THEIRS");
         let (before_a, before_b) = (listing(&a), listing(&b));
-        let exact = Exact { stem: "P".into(), pictures: vec![("x-2.png".into(), "x.png".into())] };
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: vec![("x-2.png".into(), "x.png".into())] };
         let err = move_page(&p, &b, Some(&exact)).err().unwrap();
         assert!(err.contains("already has a different picture named \"x.png\""), "{err}");
         assert_eq!((listing(&a), listing(&b)), (before_a, before_b));

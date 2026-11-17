@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const DEPTH: usize = 20;
 
@@ -9,6 +9,22 @@ pub enum Step {
     RenameSection { from: PathBuf, to: PathBuf },
     Delete { path: PathBuf, entry: PathBuf, section: bool },
     Create { path: PathBuf, section: bool, entry: Option<PathBuf> },
+}
+
+impl Step {
+    /// Records where the item really ended up: after an undo that is the old place (`from`), after a
+    /// redo the new one (`to`). Only for the steps that move or rename something.
+    pub fn set_result(&mut self, undoing: bool, path: &Path) {
+        match self {
+            Step::MovePage { from, to, .. }
+            | Step::MoveSection { from, to }
+            | Step::RenamePage { from, to, .. }
+            | Step::RenameSection { from, to } => {
+                *(if undoing { from } else { to }) = path.to_path_buf();
+            }
+            Step::Delete { .. } | Step::Create { .. } => {}
+        }
+    }
 }
 
 pub struct Record {
@@ -86,6 +102,24 @@ mod tests {
             step: Step::MoveSection { from: PathBuf::from("a"), to: PathBuf::from("b") },
             label: label.to_string(),
         }
+    }
+
+    #[test]
+    fn set_result_writes_the_real_path() {
+        let mut step = Step::RenamePage {
+            from: PathBuf::from("X.markdown"),
+            to: PathBuf::from("Y.md"),
+            old_title: "X".into(),
+            new_title: "Y".into(),
+        };
+        step.set_result(true, Path::new("X.md"));
+        step.set_result(false, Path::new("Y.md"));
+        let Step::RenamePage { from, to, .. } = &step else { panic!() };
+        assert_eq!((from.as_path(), to.as_path()), (Path::new("X.md"), Path::new("Y.md")));
+        let mut m = Step::MoveSection { from: PathBuf::from("a"), to: PathBuf::from("b") };
+        m.set_result(false, Path::new("b (2)"));
+        let Step::MoveSection { from, to } = &m else { panic!() };
+        assert_eq!((from.as_path(), to.as_path()), (Path::new("a"), Path::new("b (2)")));
     }
 
     #[test]

@@ -9,6 +9,11 @@ use crate::undo::{Record, Step};
 const GONE: &str = "it is not there any more";
 
 /// The folder an item lies in, or the "not there" reason for a path without one.
+/// The extension of a page file, without the dot (`md` when it has none).
+fn page_ext(p: &Path) -> String {
+    p.extension().map_or_else(|| "md".to_string(), |e| e.to_string_lossy().to_string())
+}
+
 fn parent_of(p: &Path) -> Result<PathBuf, String> {
     p.parent().map(Path::to_path_buf).ok_or_else(|| GONE.to_string())
 }
@@ -22,11 +27,11 @@ impl NoteApp {
     /// Renames a page; the file is named after `stem` when given (refused when that name is taken),
     /// otherwise after `title`. The open page is saved first and reopened under the new name.
     /// Returns the new path of the page.
-    pub(super) fn rename_page_now(&mut self, path: &Path, title: &str, stem: Option<&str>) -> Result<PathBuf, String> {
+    pub(super) fn rename_page_now(&mut self, path: &Path, title: &str, exact: Option<&Path>) -> Result<PathBuf, String> {
         page_free(path)?;
         let sub = store::subpage_dir(path);
         let open = self.release_open_page(|p| store::same_path(p, path) || store::is_within(p, &sub))?;
-        let new_path = match store::rename_page(path, title, stem) {
+        let new_path = match store::rename_page(path, title, exact) {
             Ok(p) => p,
             Err(e) => {
                 if let Some(r) = &open {
@@ -181,17 +186,18 @@ impl NoteApp {
     /// Does one step in one direction: the checks in their order (item there, folder open, nobody
     /// editing, exact names), then the operation. Returns what to make visible in the tree.
     fn apply_step(&mut self, step: &mut Step, undoing: bool) -> Result<Option<PathBuf>, String> {
-        match step {
+        match &mut *step {
             Step::MovePage { from, to, pictures } => {
                 let (item, dest) = if undoing { (to.clone(), from.clone()) } else { (from.clone(), to.clone()) };
                 let target = parent_of(&dest)?;
                 self.check_step(&item, &target)?;
                 let exact = mover::Exact {
                     stem: store::file_stem(&dest),
+                    ext: page_ext(&dest),
                     pictures: if undoing { undo::invert(pictures) } else { pictures.clone() },
                 };
                 let moved = self.do_move(&item, &target, Some(&exact))?.ok_or("it cannot be moved there")?;
-                let _ = moved;
+                step.set_result(undoing, &moved.path);
                 Ok(Some(target))
             }
             Step::MoveSection { from, to } => {
@@ -199,24 +205,26 @@ impl NoteApp {
                 let target = parent_of(&dest)?;
                 self.check_step(&item, &target)?;
                 let moved = self.do_move_section(&item, &target, Some(&folder_name(&dest)))?.ok_or("it cannot be moved there")?;
+                step.set_result(undoing, &moved.path);
                 Ok(Some(moved.path))
             }
             Step::RenamePage { from, to, old_title, new_title } => {
                 let (item, dest, title) = if undoing { (to.clone(), from.clone(), old_title.clone()) } else { (from.clone(), to.clone(), new_title.clone()) };
                 let place = parent_of(&item)?;
                 self.check_step(&item, &place)?;
-                self.rename_page_now(&item, &title, Some(&store::file_stem(&dest)))?;
+                let new = self.rename_page_now(&item, &title, Some(&dest))?;
+                step.set_result(undoing, &new);
                 Ok(Some(place))
             }
             Step::RenameSection { from, to } => {
                 let (item, dest) = if undoing { (to.clone(), from.clone()) } else { (from.clone(), to.clone()) };
                 self.check_step(&item, &parent_of(&item)?)?;
                 let new = self.rename_section_now(&item, &folder_name(&dest))?.ok_or("it cannot be renamed")?;
+                step.set_result(undoing, &new);
                 Ok(Some(new))
             }
             Step::Delete { path, entry, section } => {
                 if undoing {
-                    let _ = section;
                     self.restore_exact(entry, &parent_of(path)?)
                 } else {
                     *entry = self.delete_again(path, *section)?;

@@ -295,9 +295,12 @@ pub fn deleted_item_at(entry: &Path) -> Option<DeletedItem> {
     read_entry(history.parent()?, entry)
 }
 
-/// A name based on `stem` for which neither `<name>.md` nor a folder `<name>` exists in `folder`.
+/// A name based on `stem` for which neither `<name>.md`, `<name>.markdown` nor a folder `<name>`
+/// exists in `folder` (the file system ignores case).
 fn free_name(folder: &Path, stem: &str, page: bool) -> String {
-    let taken = |n: &str| folder.join(n).exists() || (page && folder.join(format!("{n}.md")).exists());
+    let taken = |n: &str| {
+        folder.join(n).exists() || (page && ["md", "markdown"].iter().any(|e| folder.join(format!("{n}.{e}")).exists()))
+    };
     let mut name = stem.to_string();
     let mut n = 2;
     while taken(&name) {
@@ -758,6 +761,26 @@ new
         assert!(entry.is_dir());
         let back = restore_deleted(&item, false).unwrap();
         assert_eq!(back, top.join("P (2).md"));
+        let _ = fs::remove_dir_all(&top);
+    }
+
+    #[test]
+    fn restore_exact_refuses_taken_markdown() {
+        let top = temp("restexactmd");
+        let p = page_with(&top, "P.md", "
+old
+");
+        let entry = delete_page(&p, at(9, 0)).unwrap();
+        let newer = page_with(&top, "P.markdown", "
+new
+");
+        let item = deleted_item_at(&entry).unwrap();
+        assert!(restore_deleted(&item, true).is_err());
+        assert!(entry.is_dir());
+        assert!(fs::read_to_string(&newer).unwrap().contains("new"));
+        let back = restore_deleted(&item, false).unwrap();
+        assert_eq!(back, top.join("P (2).md"));
+        assert!(fs::read_to_string(&newer).unwrap().contains("new"));
         let _ = fs::remove_dir_all(&top);
     }
 
