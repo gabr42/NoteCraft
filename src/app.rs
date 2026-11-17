@@ -174,6 +174,12 @@ pub struct NoteApp {
     status: String,
     status_at: Instant,
     actions: Vec<Action>,
+    /// A folder to make visible in the tree the next time it is drawn: the folders above it are
+    /// expanded and it is scrolled into view. Cleared after the first draw in which no group above
+    /// it is still opening, and when no tree is drawn.
+    reveal: Option<PathBuf>,
+    /// Set during a tree draw while a group above `reveal` is still opening.
+    reveal_settling: bool,
 
     screenshot: Option<PathBuf>,
     frames: u64,
@@ -260,6 +266,8 @@ impl NoteApp {
             status_at: Instant::now(),
             actions: Vec::new(),
             screenshot,
+            reveal: None,
+            reveal_settling: false,
             frames: 0,
             shot_requested: false,
             shot_saved: false,
@@ -330,7 +338,7 @@ impl NoteApp {
         self.pages.clear();
         self.start_indexing();
 
-        let wanted = want_page.filter(|p| p.is_file() && self.roots.iter().any(|r| p.starts_with(r))).map(|p| p.to_path_buf());
+        let wanted = want_page.filter(|p| p.is_file() && self.roots.iter().any(|r| store::is_within(p, r))).map(|p| p.to_path_buf());
         if let Some(p) = wanted {
             let dir = self.folder_of_page(&p);
             self.select_folder(dir, false);
@@ -365,11 +373,11 @@ impl NoteApp {
             self.active -= 1;
         }
         self.active = self.active.min(self.roots.len().saturating_sub(1));
-        if self.selected_folder.as_ref().is_some_and(|s| s.starts_with(dir)) {
+        if self.selected_folder.as_ref().is_some_and(|s| store::is_within(s, dir)) {
             self.selected_folder = None;
             self.pages.clear();
         }
-        if self.page.as_ref().is_some_and(|p| p.path.starts_with(dir)) {
+        if self.page.as_ref().is_some_and(|p| store::is_within(&p.path, dir)) {
             self.page = None;
             self.lock = None;
             self.mode = Mode::View;
@@ -405,14 +413,15 @@ impl NoteApp {
 
     /// Shows the top folder that holds `dir` in the left column.
     fn show_root_of(&mut self, dir: &Path) {
-        if let Some(i) = self.roots.iter().position(|r| dir.starts_with(r)) {
+        if let Some(i) = self.roots.iter().position(|r| store::is_within(dir, r)) {
             self.active = i;
         }
     }
 
     fn select_folder(&mut self, dir: PathBuf, open_first: bool) {
         self.show_root_of(&dir);
-        if self.selected_folder.as_ref() != Some(&dir) {
+        self.reveal = Some(dir.clone());
+        if !self.selected_folder.as_ref().is_some_and(|s| store::same_path(s, &dir)) {
             self.selected_folder = Some(dir.clone());
         }
         self.pages = store::list_pages(&dir, self.sort);
@@ -563,31 +572,46 @@ impl NoteApp {
         }
     }
 
-    /// Moves or renames the folder `folder` with `op`, which returns its new path (`None`: nothing was
-    /// done). The open page inside it is saved first and opened again afterwards, at the new place on
-    /// success and at the old one otherwise; the index, the selection and the tree follow the folder.
+    /// Moves or renames the folder `folder` with `op`, which returns where it went and what stayed
+    /// behind (`None`: nothing was done). The open page inside it is saved first and opened again
+    /// afterwards, at the new place on success and at the old one otherwise; the index, the selection
+    /// and the tree follow the folder, and what stayed behind is indexed again at the old place.
     pub(super) fn relocate_folder(
         &mut self,
         folder: &Path,
-        op: impl FnOnce() -> Result<Option<PathBuf>, String>,
-    ) -> Result<Option<PathBuf>, String> {
+        op: impl FnOnce() -> Result<Option<mover::Moved>, String>,
+    ) -> Result<Option<mover::Moved>, String> {
         folder_free(folder)?;
-        let open = self.release_open_page(|p| mover::is_within(p, folder))?;
-        let new = match op() {
-            Ok(Some(new)) => new,
+        let open = self.release_open_page(|p| store::is_within(p, folder))?;
+        let moved = match op() {
+            Ok(Some(moved)) => moved,
             other => {
+                if other.is_err() {
+                    // A failed move removes its partial copy, but that can fail too: show the disk.
+                    self.reload_tree();
+                    self.reload_pages();
+                }
                 if let Some(r) = &open {
                     self.reopen(r, &r.path.clone());
                 }
                 return other;
             }
         };
-        self.index.remove_tree(folder);
-        self.index.add_tree(&new);
+        let new = moved.path.clone();
+        // Moving or renaming a folder changes no page text: no need to read the files again.
+        self.index.relocate(folder, &new);
+        if !moved.left_behind.is_empty() {
+            // What could not be removed is still there and still found.
+            self.index.add_tree(folder);
+        }
         self.index_stale = true;
+        // Show the folder at its new place, also inside a collapsed group (only when its notebook is
+        // shown), or the selection when that was inside it.
+        self.reveal = Some(new.clone());
         if let Some(sel) = self.selected_folder.clone()
-            && let Some(moved) = mover::rebase(&sel, folder, &new)
+            && let Some(moved) = store::rebase(&sel, folder, &new)
         {
+            self.reveal = Some(moved.clone());
             self.selected_folder = Some(moved);
             // The selection follows the folder, also into another notebook.
             self.show_root_of(&new);
@@ -595,10 +619,10 @@ impl NoteApp {
         self.reload_tree();
         self.reload_pages();
         if let Some(r) = open {
-            let moved = mover::rebase(&r.path, folder, &new).unwrap_or(r.path.clone());
+            let moved = store::rebase(&r.path, folder, &new).unwrap_or(r.path.clone());
             self.reopen(&r, &moved);
         }
-        Ok(Some(new))
+        Ok(Some(moved))
     }
 
     /// Keeps the text from here as a separate page instead of overwriting the other version.
@@ -734,7 +758,7 @@ impl NoteApp {
                 Action::OpenPage(p) => self.open_page(&p),
                 Action::OpenHit(p) => {
                     let dir = self.folder_of_page(&p);
-                    if self.selected_folder.as_ref() != Some(&dir) {
+                    if !self.selected_folder.as_ref().is_some_and(|s| store::same_path(s, &dir)) {
                         self.select_folder(dir, false);
                     }
                     self.open_page(&p);
@@ -1018,6 +1042,7 @@ impl NoteApp {
             ui.add_space(4.0);
             if self.trees.is_empty() {
                 ui.label(RichText::new("No folder open").color(MUTED));
+                self.reveal = None;
                 return;
             }
             // Which top folder is shown.
@@ -1041,10 +1066,14 @@ impl NoteApp {
                 self.actions.push(Action::SelectRoot(chosen));
             }
             ui.add_space(4.0);
-            let Some(tree) = self.trees.get(self.active).cloned() else { return };
+            let Some(tree) = self.trees.get(self.active).cloned() else {
+                self.reveal = None;
+                return;
+            };
             // During a drag, the other notebooks get drop rows below the tree (no row above it moves).
             let drop_notebooks = self.drop_notebooks(ui.ctx());
             let tree_height = (ui.available_height() - Self::drop_strip_height(drop_notebooks.len())).max(40.0);
+            self.reveal_settling = false;
             egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(tree_height).show(ui, |ui| {
                 for child in &tree.children {
                     self.folder_row(ui, child, 0);
@@ -1054,6 +1083,13 @@ impl NoteApp {
                     self.folder_leaf(ui, &tree, 0, "(top folder)");
                 }
             });
+            // Scroll to the revealed row again on the next frames until the groups above it are
+            // fully open; then (or when it is not in this tree) it is done.
+            if self.reveal_settling {
+                ui.ctx().request_repaint();
+            } else {
+                self.reveal = None;
+            }
             self.notebook_drop_strip(ui, &drop_notebooks);
         });
     }
@@ -1064,10 +1100,17 @@ impl NoteApp {
             return;
         }
         let id = Id::unique(("folder", &f.path));
-        let on_path = self.selected_folder.as_ref().is_some_and(|s| s.starts_with(&f.path) && s != &f.path);
+        let above = |p: &Option<PathBuf>| p.as_ref().is_some_and(|s| store::is_within(s, &f.path) && !store::same_path(s, &f.path));
+        let on_path = above(&self.selected_folder);
         let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, depth < 2 || on_path);
-        if on_path && !state.is_open() && self.frames < 3 {
-            state.set_open(true);
+        if above(&self.reveal) {
+            if !state.is_open() {
+                state.set_open(true);
+            }
+            // While this group is still opening, the row below it is not at its final place yet.
+            if state.openness(ui.ctx()) < 1.0 {
+                self.reveal_settling = true;
+            }
         }
         let header = state.show_header(ui, |ui| {
             self.folder_label(ui, f, depth, &f.name);
@@ -1087,11 +1130,15 @@ impl NoteApp {
     }
 
     fn folder_label(&mut self, ui: &mut egui::Ui, f: &Folder, depth: usize, name: &str) {
-        let selected = self.selected_folder.as_ref() == Some(&f.path);
+        let selected = self.selected_folder.as_ref().is_some_and(|s| store::same_path(s, &f.path));
+        let is_root = self.roots.iter().any(|r| store::same_path(r, &f.path));
         let width = ui.available_width().max(60.0);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::click());
         // Sections and section groups can be dragged; open notebooks cannot.
-        let resp = if self.roots.contains(&f.path) { resp } else { Self::section_drag_source(&resp, &f.path, name) };
+        let resp = if is_root { resp } else { Self::section_drag_source(&resp, &f.path, name) };
+        if self.reveal.as_ref().is_some_and(|r| store::same_path(r, &f.path)) {
+            resp.scroll_to_me(None);
+        }
         let painter = ui.painter_at(rect);
         if selected {
             painter.rect_filled(rect, CornerRadius::same(4), ACCENT_SOFT);
@@ -1116,7 +1163,6 @@ impl NoteApp {
         self.page_drop_target(ui, &resp, &f.path);
         self.section_drop_target(ui, &resp, &f.path);
         let path = f.path.clone();
-        let is_root = self.roots.contains(&path);
         let resp = resp.on_hover_text(name);
         resp.context_menu(|ui| {
             if ui.button("New page here").clicked() {
@@ -1650,9 +1696,8 @@ impl NoteApp {
                 need(title)?;
                 page_free(path)?;
                 let new_path = store::rename_page(path, title)?;
-                self.index.remove_tree(&store::subpage_dir(path));
+                self.index.relocate(&store::subpage_dir(path), &store::subpage_dir(&new_path));
                 self.index.remove(path);
-                self.index.add_tree(&store::subpage_dir(&new_path));
                 self.index.add(&new_path);
                 self.index_stale = true;
                 let was_open = self.page.as_ref().is_some_and(|p| &p.path == path);
@@ -1671,7 +1716,7 @@ impl NoteApp {
                 self.index.remove(path);
                 self.index.remove_tree(&store::subpage_dir(path));
                 self.index_stale = true;
-                let was_open = self.page.as_ref().is_some_and(|p| p.path.starts_with(store::subpage_dir(path)) || &p.path == path);
+                let was_open = self.page.as_ref().is_some_and(|p| store::is_within(&p.path, &store::subpage_dir(path)) || store::same_path(&p.path, path));
                 if was_open {
                     self.page = None;
                 }
@@ -1694,12 +1739,14 @@ impl NoteApp {
             }
             Dialog::RenameSection { path, name } => {
                 need(name)?;
-                self.relocate_folder(path, || store::rename_folder(path, name).map(Some))?;
+                self.relocate_folder(path, || {
+                    store::rename_folder(path, name).map(|p| Some(mover::Moved { path: p, left_behind: Vec::new() }))
+                })?;
                 self.set_status(format!("Section renamed to \"{}\"", name.trim()));
             }
             Dialog::DeleteSection { path, name, .. } => {
                 folder_free(path)?;
-                let open = self.release_open_page(|p| mover::is_within(p, path))?;
+                let open = self.release_open_page(|p| store::is_within(p, path))?;
                 if let Err(e) = store::delete_folder(path) {
                     if let Some(r) = &open {
                         self.reopen(r, &r.path.clone());
@@ -1708,7 +1755,7 @@ impl NoteApp {
                 }
                 self.index.remove_tree(path);
                 self.index_stale = true;
-                if self.selected_folder.as_ref().is_some_and(|s| mover::is_within(s, path)) {
+                if self.selected_folder.as_ref().is_some_and(|s| store::is_within(s, path)) {
                     self.selected_folder = None;
                     self.pages.clear();
                 }

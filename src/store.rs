@@ -501,6 +501,35 @@ pub(crate) fn path_key(p: &Path) -> Vec<String> {
     p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect()
 }
 
+/// Whether two paths name the same file or folder (case-insensitive).
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
+    path_key(a) == path_key(b)
+}
+
+/// Whether `p` is `dir` or lies below it (case-insensitive).
+pub(crate) fn is_within(p: &Path, dir: &Path) -> bool {
+    key_within(&path_key(p), &path_key(dir))
+}
+
+/// `is_within` on keys made by `path_key`.
+fn key_within(p: &[String], dir: &[String]) -> bool {
+    p.len() >= dir.len() && p[..dir.len()] == dir[..]
+}
+
+/// `p` with its leading `from` replaced by `to` (case-insensitive), or `None` when `p` is not
+/// `from` or below it.
+pub(crate) fn rebase(p: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    is_within(p, from).then(|| to.join(p.components().skip(from.components().count()).collect::<PathBuf>()))
+}
+
+/// "Top-level folder › Section › ..." for `folder`, which lies in one of `roots`; empty otherwise.
+pub(crate) fn place_in(roots: &[PathBuf], folder: &Path) -> String {
+    let Some(root) = roots.iter().find(|r| is_within(folder, r)) else { return String::new() };
+    // Keep the root's own name in front: skip only the components of its parent.
+    let skip = root.parent().map_or(root.components().count(), |b| b.components().count());
+    folder.components().skip(skip).map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join(" › ")
+}
+
 /// Whether a new top-level folder may be added to the open ones: it must not be one of them,
 /// lie inside one of them, or contain one of them.
 pub fn check_new_root(existing: &[PathBuf], new: &Path) -> Result<(), String> {
@@ -558,6 +587,25 @@ pub struct IndexedPage {
     pub text: Vec<char>,
     folded_title: Vec<char>,
     folded_text: Vec<char>,
+    /// `path_key(path)`, so that finding a page by path does not build a key per page.
+    key: Vec<String>,
+}
+
+/// Reads a page for the index; `None` when it cannot be read.
+fn read_indexed(path: &Path, place: String) -> Option<IndexedPage> {
+    let doc = read_doc(path).ok()?;
+    let title = doc.title_or(path);
+    let text: Vec<char> = crate::render::plain_text(&doc.body).chars().collect();
+    let folded_text: Vec<char> = text.iter().map(|c| fold_char(*c)).collect();
+    Some(IndexedPage {
+        place,
+        folded_title: fold(&title),
+        key: path_key(path),
+        path: path.to_path_buf(),
+        title,
+        text,
+        folded_text,
+    })
 }
 
 pub struct SearchHit {
@@ -591,7 +639,9 @@ impl Index {
                             stack.push(p);
                         }
                     } else if is_md(&p) {
-                        idx.add(&p);
+                        // Every file is listed once: no need to look for an older entry.
+                        let place = idx.place_of(&p);
+                        idx.pages.extend(read_indexed(&p, place));
                     }
                 }
             }
@@ -601,45 +651,47 @@ impl Index {
 
     pub fn add(&mut self, path: &Path) {
         self.remove(path);
-        let Ok(doc) = read_doc(path) else { return };
-        let title = doc.title_or(path);
-        let plain = crate::render::plain_text(&doc.body);
-        let text: Vec<char> = plain.chars().collect();
-        let folded_text: Vec<char> = text.iter().map(|c| fold_char(*c)).collect();
-        self.pages.push(IndexedPage {
-            place: self.place_of(path),
-            folded_title: fold(&title),
-            path: path.to_path_buf(),
-            title,
-            text,
-            folded_text,
-        });
+        let place = self.place_of(path);
+        self.pages.extend(read_indexed(path, place));
     }
 
     pub fn remove(&mut self, path: &Path) {
-        self.pages.retain(|p| p.path != path);
+        let key = path_key(path);
+        self.pages.retain(|p| p.key != key);
     }
 
     /// Removes everything at or below `path` (a deleted or renamed folder).
     pub fn remove_tree(&mut self, path: &Path) {
-        self.pages.retain(|p| !p.path.starts_with(path));
+        let dir = path_key(path);
+        self.pages.retain(|p| !key_within(&p.key, &dir));
     }
 
+    /// Indexes every page at or below `path` (replacing what was indexed there); reads each file once.
     pub fn add_tree(&mut self, path: &Path) {
-        let sub = Index::build(&[path.to_path_buf()]);
-        for p in sub.pages {
-            self.add(&p.path);
+        self.remove_tree(path);
+        for mut p in Index::build(&[path.to_path_buf()]).pages {
+            p.place = self.place_of(&p.path);
+            self.pages.push(p);
+        }
+    }
+
+    /// Follows a file or folder that was moved or renamed from `from` to `to` without reading any
+    /// file: the pages at or below `from` get their new path and place. Titles stay as they were.
+    pub fn relocate(&mut self, from: &Path, to: &Path) {
+        let (roots, dir, skip) = (&self.roots, path_key(from), from.components().count());
+        for p in &mut self.pages {
+            if key_within(&p.key, &dir) {
+                let new = to.join(p.path.components().skip(skip).collect::<PathBuf>());
+                p.place = place_in(roots, new.parent().unwrap_or(Path::new("")));
+                p.key = path_key(&new);
+                p.path = new;
+            }
         }
     }
 
     /// "Top-level folder › Section › ..." for a page.
     pub(crate) fn place_of(&self, path: &Path) -> String {
-        let dir = path.parent().unwrap_or(Path::new(""));
-        let root = self.roots.iter().find(|r| dir.starts_with(r));
-        // Strip the parent of the root, so the root's own name stays in front.
-        let base = root.map(|r| r.parent().unwrap_or(r.as_path()));
-        let rel = base.and_then(|b| dir.strip_prefix(b).ok()).map(|p| p.to_path_buf()).unwrap_or_default();
-        rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join(" › ")
+        place_in(&self.roots, path.parent().unwrap_or(Path::new("")))
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
@@ -738,6 +790,23 @@ fn make_snippet(text: &[char], pos: usize, len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebase_ignores_case_and_rejects_outside_paths() {
+        let (from, to) = (Path::new(r"C:\Notes\Work"), Path::new(r"D:\Other\Work (2)"));
+        assert_eq!(rebase(Path::new(r"c:\notes\WORK\a\b.md"), from, to), Some(PathBuf::from(r"D:\Other\Work (2)\a\b.md")));
+        assert_eq!(rebase(Path::new(r"C:\Notes\work"), from, to), Some(to.to_path_buf()));
+        assert_eq!(rebase(Path::new(r"C:\Notes\Workshop\a.md"), from, to), None);
+        assert_eq!(rebase(Path::new(r"C:\Notes"), from, to), None);
+    }
+
+    #[test]
+    fn place_in_starts_with_the_root_name_and_ignores_case() {
+        let roots = vec![PathBuf::from(r"C:\Data\Notes")];
+        assert_eq!(place_in(&roots, Path::new(r"c:\data\notes\Work\Plans")), "notes › Work › Plans");
+        assert_eq!(place_in(&roots, Path::new(r"C:\Data\Notes")), "Notes");
+        assert_eq!(place_in(&roots, Path::new(r"C:\Elsewhere")), "");
+    }
 
     #[test]
     fn front_matter_round_trip() {
@@ -897,7 +966,34 @@ mod tests {
         let late = create_page(&soups, "Late goulash").unwrap();
         idx.add(&late);
         assert!(idx.search("late", 10).iter().any(|h| h.place == "A › Soups"));
+
+        // A section moved to the other folder: the index follows without reading the files.
+        let moved = b.join("Soups");
+        fs::rename(&soups, &moved).unwrap();
+        idx.relocate(&soups, &moved);
+        let hits = idx.search("goulash", 10);
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|h| store_place_ok(h, &b)), "{:?}", hits.iter().map(|h| (&h.path, &h.place)).collect::<Vec<_>>());
+
+        // add_tree replaces what was there and gives each page its place in the open folders.
+        create_page(&moved, "Fresh goulash").unwrap();
+        idx.add_tree(&moved);
+        assert_eq!(idx.pages.len(), 5);
+        assert!(idx.search("fresh", 10).iter().any(|h| h.place == "B › Soups"));
+
+        // Paths are found without case, also after a relocate (the stored key follows the path).
+        let late_now = moved.join(late.file_name().unwrap());
+        idx.remove(Path::new(&late_now.to_string_lossy().to_uppercase()));
+        assert_eq!(idx.pages.len(), 4);
+        idx.remove_tree(Path::new(&moved.to_string_lossy().to_lowercase()));
+        // Left: the loose page in A and the trout in B › Fish.
+        assert_eq!(idx.pages.len(), 2);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A goulash hit after the move: the trout in B › Fish, the soups now in B › Soups.
+    fn store_place_ok(h: &SearchHit, b: &Path) -> bool {
+        is_within(&h.path, b) && h.path.is_file() && (h.place == "B › Soups" || h.place == "B › Fish")
     }
 
     #[test]

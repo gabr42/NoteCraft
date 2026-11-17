@@ -529,14 +529,6 @@ fn collect_history(folder: &Path, history: &Path, cancel: &AtomicBool, out: &mut
     }
 }
 
-/// "Top-level folder › Section › ..." like the normal search shows it.
-pub fn place_of(roots: &[PathBuf], folder: &Path) -> String {
-    let root = roots.iter().find(|r| folder.starts_with(r));
-    let base = root.map(|r| r.parent().unwrap_or(r.as_path()));
-    let rel = base.and_then(|b| folder.strip_prefix(b).ok()).unwrap_or(Path::new(""));
-    rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join(" › ")
-}
-
 /// The newest matching text of a page, with a count of the older ones that match too.
 fn match_group(g: &Group, roots: &[PathBuf], words: &[Vec<char>], cancel: &AtomicBool) -> Option<HistoryHit> {
     let mut hit: Option<HistoryHit> = None;
@@ -557,7 +549,7 @@ fn match_group(g: &Group, roots: &[PathBuf], words: &[Vec<char>], cancel: &Atomi
                 file: file.clone(),
                 kind: g.kind.clone(),
                 title,
-                place: place_of(roots, &g.folder),
+                place: crate::store::place_in(roots, &g.folder),
                 snippet,
                 count,
                 when: *when,
