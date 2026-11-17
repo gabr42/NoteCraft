@@ -189,9 +189,14 @@ impl NoteApp {
         // The open page, when it moves along (the page itself or one of its subpages).
         let open = self.release_open_page(|p| store::same_path(p, page) || store::is_within(p, &sub))?;
         let title = store::read_doc(page).map(|d| d.title_or(page)).unwrap_or_else(|_| store::file_stem(page));
-        let new = match mover::move_page(page, target_dir) {
-            Ok(Some(new)) => new,
+        let mover::Moved { path: new, left_behind } = match mover::move_page(page, target_dir) {
+            Ok(Some(moved)) => moved,
             other => {
+                if other.is_err() {
+                    // A failed move is undone, but a half-removed copy may be left: show the disk.
+                    self.reload_tree();
+                    self.reload_pages();
+                }
                 if let Some(r) = &open {
                     self.reopen(r, &r.path.clone());
                 }
@@ -203,6 +208,13 @@ impl NoteApp {
         self.index.remove(page);
         self.index.add(&new);
         self.index.relocate(&sub, &store::subpage_dir(&new));
+        // What could not be removed is still there and still found.
+        if page.is_file() {
+            self.index.add(page);
+        }
+        if sub.is_dir() {
+            self.index.add_tree(&sub);
+        }
         self.index_stale = true;
         self.reload_tree();
         self.reload_pages();
@@ -211,6 +223,10 @@ impl NoteApp {
             self.reopen(r, &reopened);
         }
         self.set_status(format!("Moved \"{title}\" to {}", self.index.place_of(&new)));
+        if !left_behind.is_empty() {
+            let text = left_behind_text(&format!("The page \"{title}\""), &left_behind);
+            self.show_message("Move page", text);
+        }
         Ok(())
     }
 
@@ -219,11 +235,22 @@ impl NoteApp {
         if !mover::can_move_section_to(folder, target) {
             return Ok(());
         }
-        let Some(new) = self.relocate_folder(folder, || mover::move_section(folder, target))? else {
+        let mut left_behind = Vec::new();
+        let op = || mover::move_section(folder, target).map(|m| m.map(|m| {
+            left_behind = m.left_behind;
+            m.path
+        }));
+        let Some(new) = self.relocate_folder(folder, op)? else {
             return Ok(());
         };
         // `new` carries the final name ("Name (2)" after a name clash).
         self.set_status(format!("Moved section \"{}\" to {}", folder_name(&new), self.index.place_of(&new)));
+        if !left_behind.is_empty() {
+            // What could not be removed is still there and still found.
+            self.index.add_tree(folder);
+            let text = left_behind_text(&format!("The section \"{}\"", folder_name(&new)), &left_behind);
+            self.show_message("Move section", text);
+        }
         Ok(())
     }
 
@@ -333,4 +360,20 @@ impl NoteApp {
         }
         self.move_win = Some(win);
     }
+}
+
+/// The message after a move whose copy is complete but whose originals were not all removed.
+fn left_behind_text(what: &str, left: &[PathBuf]) -> String {
+    const SHOWN: usize = 10;
+    let mut text = format!(
+        "{what} was moved, but these files could not be removed from the old place. They are \
+         probably open in another program; delete them once they are free:\n"
+    );
+    for p in left.iter().take(SHOWN) {
+        text.push_str(&format!("\n{}", p.display()));
+    }
+    if left.len() > SHOWN {
+        text.push_str(&format!("\n… and {} more", left.len() - SHOWN));
+    }
+    text
 }

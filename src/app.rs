@@ -581,6 +581,11 @@ impl NoteApp {
         let new = match op() {
             Ok(Some(new)) => new,
             other => {
+                if other.is_err() {
+                    // A failed move removes its partial copy, but that can fail too: show the disk.
+                    self.reload_tree();
+                    self.reload_pages();
+                }
                 if let Some(r) = &open {
                     self.reopen(r, &r.path.clone());
                 }
