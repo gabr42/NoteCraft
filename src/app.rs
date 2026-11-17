@@ -1733,6 +1733,7 @@ impl NoteApp {
                 self.undo.push(undo::Record {
                     step: undo::Step::Create { path, section: false, entry: None },
                     label: format!("creation of \"{}\"", title.trim()),
+                    busy_tries: 0,
                 });
             }
             Dialog::RenamePage { path, title } => {
@@ -1745,6 +1746,7 @@ impl NoteApp {
                     self.undo.push(undo::Record {
                         step: undo::Step::RenamePage { from: path.clone(), to: new_path, old_title: old_title.clone(), new_title: title.trim().to_string() },
                         label: format!("rename of \"{old_title}\""),
+                        busy_tries: 0,
                     });
                 }
             }
@@ -1754,6 +1756,7 @@ impl NoteApp {
                 self.undo.push(undo::Record {
                     step: undo::Step::Delete { path: path.clone(), entry, section: false },
                     label: format!("deletion of \"{title}\""),
+                    busy_tries: 0,
                 });
             }
             Dialog::NewSection { parent, name } => {
@@ -1765,6 +1768,7 @@ impl NoteApp {
                 self.undo.push(undo::Record {
                     label: format!("creation of \"{}\"", folder_name(&path)),
                     step: undo::Step::Create { path, section: true, entry: None },
+                    busy_tries: 0,
                 });
             }
             Dialog::RenameSection { path, name } => {
@@ -1775,6 +1779,7 @@ impl NoteApp {
                     self.undo.push(undo::Record {
                         step: undo::Step::RenameSection { from: path.clone(), to: new },
                         label: format!("rename of \"{}\"", folder_name(path)),
+                        busy_tries: 0,
                     });
                 }
             }
@@ -1784,6 +1789,7 @@ impl NoteApp {
                 self.undo.push(undo::Record {
                     step: undo::Step::Delete { path: path.clone(), entry, section: true },
                     label: format!("deletion of \"{name}\""),
+                    busy_tries: 0,
                 });
             }
             Dialog::Message { .. } => {}

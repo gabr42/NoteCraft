@@ -233,6 +233,7 @@ impl NoteApp {
             self.undo.push(undo::Record {
                 step: undo::Step::MovePage { from: page.to_path_buf(), to: new, pictures: moved.pictures.clone(), kept: moved.kept.clone() },
                 label: format!("move of \"{title}\""),
+                busy_tries: 0,
             });
         }
         Ok(Some(moved))
@@ -259,6 +260,7 @@ impl NoteApp {
             self.undo.push(undo::Record {
                 step: undo::Step::MoveSection { from: folder.to_path_buf(), to: new },
                 label: format!("move of \"{old_name}\""),
+                busy_tries: 0,
             });
         }
         Ok(Some(moved))

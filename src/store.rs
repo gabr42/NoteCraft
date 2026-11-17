@@ -450,8 +450,9 @@ pub fn save_conflict_copy(path: &Path, body: &str, computer: &str) -> Result<Pat
 /// With `exact` (the path the page must get) the file becomes exactly that name and extension, and
 /// the rename is refused (before anything is written) when another page or folder already has that
 /// name; without it the name follows the title and the extension becomes `.md`.
-/// All or nothing: the title is written only after the file was renamed, and the file gets its old
-/// name back when that write fails.
+/// All or nothing: the subpages folder is renamed first, then the file, and the title is written
+/// last; when a step fails, the earlier ones are turned back (`Partial` when that fails too). A
+/// folder that already has the new name is refused, so that the subpages are not mixed with it.
 pub fn rename_page(path: &Path, new_title: &str, exact: Option<&Path>) -> Result<PathBuf, OpError> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let stem = exact.map(file_stem);
@@ -471,25 +472,37 @@ pub fn rename_page(path: &Path, new_title: &str, exact: Option<&Path>) -> Result
     } else {
         unique_path(dir, &wanted, "md")
     };
-    if new_path != path {
-        fs::rename(path, &new_path).map_err(|e| OpError::io(format!("Could not rename the file: {e}"), &e))?;
+    let old_sub = subpage_dir(path);
+    let new_sub = subpage_dir(&new_path);
+    let move_sub = new_sub != old_sub && old_sub.is_dir();
+    if move_sub && new_sub.exists() && !same_path(&new_sub, &old_sub) {
+        return Err(OpError::refused(format!("\"{}\" already has a folder \"{}\".", dir.display(), file_stem(&new_path))));
+    }
+    if move_sub {
+        fs::rename(&old_sub, &new_sub).map_err(|e| OpError::io(format!("Could not rename the subpages folder: {e}"), &e))?;
+    }
+    // Turns the earlier steps back after `err`: the file name when `file_moved`, then the subpages folder.
+    let turn_back = |err: OpError, file_moved: bool| -> OpError {
+        if file_moved && let Err(back) = fs::rename(&new_path, path) {
+            let text = format!("{err}\n\nIt could not get its old name back: {back}\nIt is now {}.", new_path.display());
+            return OpError::new(Kind::Partial, text);
+        }
+        if move_sub && let Err(back) = fs::rename(&new_sub, &old_sub) {
+            let text = format!("{err}\n\nIts subpages could not get their old folder back: {back}\nThey are now in {}.", new_sub.display());
+            return OpError::new(Kind::Partial, text);
+        }
+        err
+    };
+    if new_path != path
+        && let Err(e) = fs::rename(path, &new_path)
+    {
+        return Err(turn_back(OpError::io(format!("Could not rename the file: {e}"), &e), false));
     }
     if let Err(e) = fs::write(&new_path, doc.to_text()) {
-        let err = OpError::io(format!("Could not save the page: {e}"), &e);
-        if new_path != path
-            && let Err(back) = fs::rename(&new_path, path)
-        {
-            let text = format!("{err}\n\nIt could not get its old name back: {back}\nIt is now {}.", new_path.display());
-            return Err(OpError::new(Kind::Partial, text));
-        }
-        return Err(err);
+        return Err(turn_back(OpError::io(format!("Could not save the page: {e}"), &e), new_path != path));
     }
     if wanted == file_stem(path) {
         return Ok(new_path);
-    }
-    let old_sub = subpage_dir(path);
-    if old_sub.is_dir() {
-        let _ = fs::rename(&old_sub, subpage_dir(&new_path));
     }
     if let Err(e) = crate::history::rename_versions(path, &new_path) {
         *HISTORY_WARNING.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
@@ -985,6 +998,56 @@ mod tests {
         assert!(rename_page(&page, "New name", None).is_err());
         assert_eq!(fs::read(&page).unwrap(), before);
         drop(_lock);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A subpage folder that cannot be renamed (a file in it is open) stops the whole rename:
+    /// the page keeps its name and title and the subpages stay with it.
+    #[cfg(windows)]
+    #[test]
+    fn rename_page_subfolder_locked_changes_nothing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = temp_root("rensublock");
+        let page = create_page(&root, "Old name").unwrap();
+        let sub = create_page(&subpage_dir(&page), "Child").unwrap();
+        let before = fs::read(&page).unwrap();
+        let lock = fs::OpenOptions::new().read(true).share_mode(3).open(&sub).unwrap();
+        let e = rename_page(&page, "New name", None).unwrap_err();
+        drop(lock);
+        assert_eq!(e.kind, Kind::Busy, "{e}");
+        assert_eq!(fs::read(&page).unwrap(), before);
+        assert!(sub.is_file() && !root.join("New name.md").exists() && !root.join("New name").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// When the file cannot be renamed after its subpages folder was, the folder gets its name back.
+    #[cfg(windows)]
+    #[test]
+    fn rename_page_file_locked_turns_subfolder_back() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = temp_root("renfileback");
+        let page = create_page(&root, "Old name").unwrap();
+        let sub = create_page(&subpage_dir(&page), "Child").unwrap();
+        let lock = fs::OpenOptions::new().read(true).share_mode(3).open(&page).unwrap();
+        let e = rename_page(&page, "New name", None).unwrap_err();
+        drop(lock);
+        assert_eq!(e.kind, Kind::Busy, "{e}");
+        assert!(sub.is_file() && !root.join("New name").exists() && !root.join("New name.md").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A folder that already has the new name (not a page) is not merged with the subpages.
+    #[test]
+    fn rename_page_refuses_taken_subfolder() {
+        let root = temp_root("rensubtaken");
+        let page = create_page(&root, "Old name").unwrap();
+        let sub = create_page(&subpage_dir(&page), "Child").unwrap();
+        fs::create_dir_all(root.join("New name")).unwrap();
+        let before = fs::read(&page).unwrap();
+        let e = rename_page(&page, "New name", None).unwrap_err();
+        assert_eq!(e.kind, Kind::Refused, "{e}");
+        assert_eq!(fs::read(&page).unwrap(), before);
+        assert!(sub.is_file() && !root.join("New name.md").exists());
         let _ = fs::remove_dir_all(&root);
     }
 
