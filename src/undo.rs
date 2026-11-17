@@ -63,14 +63,10 @@ impl UndoLog {
         self.redo.push(r);
     }
 
-    // Used by the Task 5 hover texts; remove the allow then.
-    #[allow(dead_code)]
     pub fn undo_label(&self) -> Option<&str> {
         self.undo.last().map(|r| r.label.as_str())
     }
 
-    // Used by the Task 5 hover texts; remove the allow then.
-    #[allow(dead_code)]
     pub fn redo_label(&self) -> Option<&str> {
         self.redo.last().map(|r| r.label.as_str())
     }

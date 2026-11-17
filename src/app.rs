@@ -112,6 +112,8 @@ enum Action {
     StopEdit,
     Save,
     Refresh,
+    Undo,
+    Redo,
     /// Pick a folder and add it as another top-level folder.
     AddFolder,
     /// Open the Import from OneNote wizard.
@@ -845,6 +847,8 @@ impl NoteApp {
                     self.start_indexing();
                     self.set_status("Notes reloaded from disk".into());
                 }
+                Action::Undo => self.undo(),
+                Action::Redo => self.redo(),
                 Action::ToggleSource => {
                     self.source_mode = !self.source_mode;
                     self.focus_editor = true;
@@ -965,6 +969,25 @@ impl NoteApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.add(top_button("⟳")).hover_fx().on_hover_text("Reload notes from disk (F5)").clicked() {
                         self.actions.push(Action::Refresh);
+                    }
+                    ui.add_space(8.0);
+                    let redo_label = self.undo.redo_label().map(str::to_string);
+                    let redo_btn = ui.add_enabled(redo_label.is_some(), top_button("↷")).hover_fx();
+                    let redo_btn = match &redo_label {
+                        Some(l) => redo_btn.on_hover_text(format!("Redo {l} (Ctrl+Y)")),
+                        None => redo_btn.on_disabled_hover_text("Nothing to redo"),
+                    };
+                    if redo_btn.clicked() {
+                        self.actions.push(Action::Redo);
+                    }
+                    let undo_label = self.undo.undo_label().map(str::to_string);
+                    let undo_btn = ui.add_enabled(undo_label.is_some(), top_button("↶")).hover_fx();
+                    let undo_btn = match &undo_label {
+                        Some(l) => undo_btn.on_hover_text(format!("Undo {l} (Ctrl+Z)")),
+                        None => undo_btn.on_disabled_hover_text("Nothing to undo"),
+                    };
+                    if undo_btn.clicked() {
+                        self.actions.push(Action::Undo);
                     }
                     ui.add_space(8.0);
                     ui.add_space(8.0);
@@ -1759,8 +1782,12 @@ impl NoteApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let sc = |k: Key| KeyboardShortcut::new(Modifiers::COMMAND, k);
-        let (find, save, edit, new, print, refresh, esc) = ctx.input_mut(|i| {
+        let (redo_shift, redo_y, undo_z, find, save, edit, new, print, refresh, esc) = ctx.input_mut(|i| {
             (
+                // Ctrl+Shift+Z first: egui matches modifiers loosely, so Ctrl+Z would also take it.
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)),
+                i.consume_shortcut(&sc(Key::Y)),
+                i.consume_shortcut(&sc(Key::Z)),
                 i.consume_shortcut(&sc(Key::F)),
                 i.consume_shortcut(&sc(Key::S)),
                 i.consume_shortcut(&sc(Key::E)),
@@ -1772,6 +1799,19 @@ impl NoteApp {
         });
         if self.dialog.is_some() || self.import_win.is_some() || self.move_win.is_some() {
             return;
+        }
+        // Undo/redo of note management; text fields, the page editor and every window keep their own Ctrl+Z.
+        let undo_ok = self.mode != Mode::Edit
+            && ctx.memory(|m| m.focused().is_none())
+            && self.history_win.is_none()
+            && self.deleted_win.is_none()
+            && self.history_view.is_none();
+        if undo_ok {
+            if redo_shift || redo_y {
+                self.actions.push(Action::Redo);
+            } else if undo_z {
+                self.actions.push(Action::Undo);
+            }
         }
         if find {
             self.focus_search = true;
@@ -1937,6 +1977,8 @@ impl NoteApp {
                         }
                     }
                     "refresh" => self.actions.push(Action::Refresh),
+                    "undo" => self.actions.push(Action::Undo),
+                    "redo" => self.actions.push(Action::Redo),
                     _ => {}
                 },
                 WebMsg::Image { mime, data } => self.save_pasted_image(&mime, &data),

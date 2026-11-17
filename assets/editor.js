@@ -612,6 +612,8 @@
       if (k === 'p') return send('print');
       if (k === 'n') return send('new');
       if (k === 'r') return e.preventDefault();
+      if (!editing && k === 'z') return send(e.shiftKey ? 'redo' : 'undo');
+      if (!editing && k === 'y') return send('redo');
       if (k === 'k' && editing) { e.preventDefault(); link(); notify(); return; }
     }
     if (e.key === 'F5') return send('refresh');

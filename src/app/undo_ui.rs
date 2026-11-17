@@ -116,8 +116,6 @@ impl NoteApp {
     }
 
     /// Takes back the newest action.
-    // Called from Task 5 (keys and buttons); remove the allow then.
-    #[allow(dead_code)]
     pub(super) fn undo(&mut self) {
         match self.undo.take_undo() {
             Some(rec) => self.run_step(rec, true),
@@ -126,7 +124,6 @@ impl NoteApp {
     }
 
     /// Does the newest undone action again.
-    #[allow(dead_code)]
     pub(super) fn redo(&mut self) {
         match self.undo.take_redo() {
             Some(rec) => self.run_step(rec, false),
