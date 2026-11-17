@@ -31,6 +31,8 @@ const PAGE_BG: Color32 = Color32::WHITE;
 const TEXT: Color32 = Color32::from_rgb(0x25, 0x24, 0x23);
 const MUTED: Color32 = Color32::from_rgb(0x7A, 0x77, 0x74);
 const BORDER: Color32 = Color32::from_rgb(0xE1, 0xDF, 0xDD);
+/// Outline of an unfocused text box (darker than BORDER so the box stands out on white).
+const INPUT_BORDER: Color32 = Color32::from_rgb(0xB8, 0xB5, 0xB2);
 const SECTION_COLORS: [Color32; 8] = [
     Color32::from_rgb(0xD1, 0x34, 0x38),
     Color32::from_rgb(0xE8, 0x7D, 0x0D),
@@ -1665,6 +1667,11 @@ impl NoteApp {
             let is_delete = text.is_none();
             if let Some(t) = text {
                 let r = ui.add(TextEdit::singleline(t).desired_width(f32::INFINITY).margin(Margin::symmetric(6, 5)));
+                // The theme's inactive outline is transparent (see `setup_style`), which left the box
+                // invisible on the white dialog until it had focus; focused, egui draws its own outline.
+                if !r.has_focus() {
+                    ui.painter().rect_stroke(r.rect, ui.visuals().widgets.inactive.corner_radius, Stroke::new(1.0, INPUT_BORDER), egui::StrokeKind::Inside);
+                }
                 if focus {
                     r.request_focus();
                 }

@@ -72,6 +72,11 @@ impl PageWeb {
             .with_navigation_handler(|url| url.starts_with(ORIGIN))
             .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
             .with_visible(false)
+            // wry focuses a new view by default. The view lives in another process, so winit then
+            // reports the main window as unfocused and does not report it focused again when the
+            // keyboard comes back (only after the window is re-activated); egui then drew text boxes
+            // without a cursor or focus outline although typing worked.
+            .with_focused(false)
             .with_background_color((255, 255, 255, 255))
             .with_url(format!("{ORIGIN}/editor.html"))
             .build_as_child(window)
