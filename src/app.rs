@@ -2,6 +2,7 @@
 
 use crate::lock::{self, EditLock};
 use crate::mover;
+use crate::op_error::{Kind, OpError};
 use crate::render;
 use crate::store::{self, Folder, Index, PageEntry, SearchHit, SortOrder};
 use crate::undo;
@@ -573,6 +574,16 @@ impl NoteApp {
         Ok(self.page.take().map(|p| Released { path: p.path, editing }))
     }
 
+    /// After an operation that failed halfway (`Kind::Partial`): shows the disk as it is now and
+    /// indexes everything again, since it is not known which pages ended up where.
+    pub(super) fn after_partial(&mut self, e: &OpError) {
+        if e.kind == Kind::Partial {
+            self.reload_tree();
+            self.reload_pages();
+            self.start_indexing();
+        }
+    }
+
     /// Opens a page closed by `release_open_page` at `path` (its old or new place), in edit mode again
     /// when it was being edited.
     pub(super) fn reopen(&mut self, released: &Released, path: &Path) {
@@ -589,17 +600,18 @@ impl NoteApp {
     pub(super) fn relocate_folder(
         &mut self,
         folder: &Path,
-        op: impl FnOnce() -> Result<Option<mover::Moved>, String>,
-    ) -> Result<Option<mover::Moved>, String> {
-        folder_free(folder)?;
-        let open = self.release_open_page(|p| store::is_within(p, folder))?;
+        op: impl FnOnce() -> Result<Option<mover::Moved>, OpError>,
+    ) -> Result<Option<mover::Moved>, OpError> {
+        folder_free(folder).map_err(OpError::busy)?;
+        let open = self.release_open_page(|p| store::is_within(p, folder)).map_err(OpError::busy)?;
         let moved = match op() {
             Ok(Some(moved)) => moved,
             other => {
-                if other.is_err() {
+                if let Err(e) = &other {
                     // A failed move removes its partial copy, but that can fail too: show the disk.
                     self.reload_tree();
                     self.reload_pages();
+                    self.after_partial(e);
                 }
                 if let Some(r) = &open {
                     self.reopen(r, &r.path.clone());
@@ -785,13 +797,13 @@ impl NoteApp {
                 Action::ShowMove(p) => self.open_move(p),
                 Action::MovePage { page, target_dir } => {
                     if let Err(e) = self.do_move(&page, &target_dir, None) {
-                        self.show_message("Move page", e);
+                        self.show_message("Move page", e.text);
                     }
                 }
                 Action::ShowMoveSection(f) => self.open_move_section(f),
                 Action::MoveSection { folder, target } => {
                     if let Err(e) = self.do_move_section(&folder, &target, None) {
-                        self.show_message("Move section", e);
+                        self.show_message("Move section", e.text);
                     }
                 }
                 Action::DeletePage(p) => {
@@ -1964,8 +1976,9 @@ impl NoteApp {
                         }
                     }
                     "refresh" => self.actions.push(Action::Refresh),
-                    "undo" => self.actions.push(Action::Undo),
-                    "redo" => self.actions.push(Action::Redo),
+                    // While editing, Ctrl+Z belongs to the editor (as in `shortcuts`).
+                    "undo" if self.mode != Mode::Edit => self.actions.push(Action::Undo),
+                    "redo" if self.mode != Mode::Edit => self.actions.push(Action::Redo),
                     _ => {}
                 },
                 WebMsg::Image { mime, data } => self.save_pasted_image(&mime, &data),

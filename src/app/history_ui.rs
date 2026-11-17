@@ -322,6 +322,11 @@ fn section_summary(dir: &Path) -> String {
     s
 }
 
+/// The status text after a deleted item came back at `path`.
+fn restored_message(item: &history::DeletedItem, path: &Path) -> String {
+    format!("Restored \"{}\" to {}", item.name, path.display())
+}
+
 impl NoteApp {
     /// Opens the window with the deleted items of the active top folder.
     pub(super) fn open_deleted(&mut self, confirm_purge: bool) {
@@ -331,7 +336,8 @@ impl NoteApp {
     }
 
     /// Updates the index, the tree and the page list after a deleted item came back.
-    pub(super) fn after_restore_deleted(&mut self, item: &history::DeletedItem, path: &Path) -> String {
+    /// Sets no status: the restore from the history reports `restored_message`, undo its own text.
+    pub(super) fn after_restore_deleted(&mut self, item: &history::DeletedItem, path: &Path) {
         match item.kind {
             history::ItemKind::Page => {
                 self.index.add(path);
@@ -345,28 +351,36 @@ impl NoteApp {
         self.index_stale = true;
         self.reload_tree();
         self.reload_pages();
-        let msg = format!("Restored \"{}\" to {}", item.name, path.display());
-        self.set_status(msg.clone());
-        msg
     }
 
     /// Restores the deleted item kept in a `deleted\<time>` folder (from a search hit).
     fn restore_deleted_entry(&mut self, entry: &Path) -> Result<String, String> {
         let item = history::deleted_item_at(entry).ok_or_else(|| "The deleted item is not there any more.".to_string())?;
-        let path = history::restore_deleted(&item, false)?;
-        Ok(self.after_restore_deleted(&item, &path))
+        let path = history::restore_deleted(&item, false).inspect_err(|e| self.after_partial(e))?;
+        self.after_restore_deleted(&item, &path);
+        Ok(restored_message(&item, &path))
     }
 
     fn restore_deleted_now(&mut self, win: &mut DeletedWin, i: usize) {
         let Some(item) = win.items.get(i).cloned() else { return };
         match history::restore_deleted(&item, false) {
             Ok(path) => {
-                let msg = self.after_restore_deleted(&item, &path);
+                self.after_restore_deleted(&item, &path);
+                let msg = restored_message(&item, &path);
+                self.set_status(msg.clone());
                 win.message = msg;
                 win.items.remove(i);
                 win.select(None);
             }
-            Err(e) => win.message = e,
+            Err(e) => {
+                self.after_partial(&e);
+                if e.kind == Kind::Partial {
+                    // It is back, only some of its versions stayed in the history.
+                    win.items.remove(i);
+                    win.select(None);
+                }
+                win.message = e.text;
+            }
         }
     }
 

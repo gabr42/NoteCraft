@@ -43,11 +43,16 @@ pub struct UndoLog {
 impl UndoLog {
     /// A user action: newest on top, oldest dropped beyond DEPTH, redo cleared.
     pub fn push(&mut self, r: Record) {
+        self.push_capped(r);
+        self.redo.clear();
+    }
+
+    /// Puts `r` on top of the undo list and drops the oldest record beyond DEPTH.
+    fn push_capped(&mut self, r: Record) {
         self.undo.push(r);
         if self.undo.len() > DEPTH {
             self.undo.remove(0);
         }
-        self.redo.clear();
     }
 
     pub fn take_undo(&mut self) -> Option<Record> {
@@ -65,10 +70,7 @@ impl UndoLog {
 
     /// After a successful redo: the record goes back onto undo, redo is kept.
     pub fn redone(&mut self, r: Record) {
-        self.undo.push(r);
-        if self.undo.len() > DEPTH {
-            self.undo.remove(0);
-        }
+        self.push_capped(r);
     }
 
     /// Puts a record taken with `take_undo` back unchanged (the step could not start).
@@ -130,6 +132,24 @@ mod tests {
         for i in 0..=DEPTH {
             log.push(rec(&format!("r{i}")));
         }
+        let mut n = 0;
+        let mut last = String::new();
+        while let Some(r) = log.take_undo() {
+            n += 1;
+            last = r.label;
+        }
+        assert_eq!(n, DEPTH);
+        assert_eq!(last, "r1");
+    }
+
+    #[test]
+    fn redone_caps_at_depth() {
+        let mut log = UndoLog::default();
+        for i in 0..DEPTH {
+            log.push(rec(&format!("r{i}")));
+        }
+        log.redone(rec("new"));
+        assert_eq!(log.undo_label(), Some("new"));
         let mut n = 0;
         let mut last = String::new();
         while let Some(r) = log.take_undo() {

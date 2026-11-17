@@ -182,22 +182,23 @@ impl NoteApp {
     /// Moves `page` into `target_dir`; the open page is saved first and reopened at its new place.
     /// With `exact` (undo/redo) the page gets exactly that name or the move is refused, and nothing is
     /// recorded; otherwise a move that left nothing behind is recorded for undo. `Ok(None)`: nothing to do.
-    pub(super) fn do_move(&mut self, page: &Path, target_dir: &Path, exact: Option<&mover::Exact>) -> Result<Option<mover::Moved>, String> {
+    pub(super) fn do_move(&mut self, page: &Path, target_dir: &Path, exact: Option<&mover::Exact>) -> Result<Option<mover::Moved>, OpError> {
         if !mover::can_move_to(page, target_dir) {
             return Ok(None);
         }
-        page_free(page)?;
+        page_free(page).map_err(OpError::busy)?;
         let sub = store::subpage_dir(page);
         // The open page, when it moves along (the page itself or one of its subpages).
-        let open = self.release_open_page(|p| store::same_path(p, page) || store::is_within(p, &sub))?;
+        let open = self.release_open_page(|p| store::same_path(p, page) || store::is_within(p, &sub)).map_err(OpError::busy)?;
         let title = store::read_doc(page).map(|d| d.title_or(page)).unwrap_or_else(|_| store::file_stem(page));
         let moved = match mover::move_page(page, target_dir, exact) {
             Ok(Some(moved)) => moved,
             other => {
-                if other.is_err() {
+                if let Err(e) = &other {
                     // A failed move is undone, but a half-removed copy may be left: show the disk.
                     self.reload_tree();
                     self.reload_pages();
+                    self.after_partial(e);
                 }
                 if let Some(r) = &open {
                     self.reopen(r, &r.path.clone());
@@ -240,7 +241,7 @@ impl NoteApp {
     /// Moves the section `folder` into `target`; the open page inside it is saved first and reopened.
     /// With `name` (undo/redo) the section gets exactly that name or the move is refused, and nothing is
     /// recorded; otherwise a move that left nothing behind is recorded for undo.
-    pub(super) fn do_move_section(&mut self, folder: &Path, target: &Path, name: Option<&str>) -> Result<Option<mover::Moved>, String> {
+    pub(super) fn do_move_section(&mut self, folder: &Path, target: &Path, name: Option<&str>) -> Result<Option<mover::Moved>, OpError> {
         if !mover::can_move_section_to(folder, target) {
             return Ok(None);
         }
@@ -364,7 +365,7 @@ impl NoteApp {
             };
             match result {
                 Ok(()) => return,
-                Err(e) => win.message = e,
+                Err(e) => win.message = e.text,
             }
         }
         self.move_win = Some(win);

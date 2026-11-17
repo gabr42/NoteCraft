@@ -4,6 +4,7 @@ mod app;
 mod history;
 mod lock;
 mod mover;
+mod op_error;
 mod onenote;
 mod render;
 mod store;
