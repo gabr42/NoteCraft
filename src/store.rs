@@ -508,8 +508,12 @@ pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
 
 /// Whether `p` is `dir` or lies below it (case-insensitive).
 pub(crate) fn is_within(p: &Path, dir: &Path) -> bool {
-    let (p, d) = (path_key(p), path_key(dir));
-    p.len() >= d.len() && p[..d.len()] == d[..]
+    key_within(&path_key(p), &path_key(dir))
+}
+
+/// `is_within` on keys made by `path_key`.
+fn key_within(p: &[String], dir: &[String]) -> bool {
+    p.len() >= dir.len() && p[..dir.len()] == dir[..]
 }
 
 /// `p` with its leading `from` replaced by `to` (case-insensitive), or `None` when `p` is not
@@ -583,6 +587,25 @@ pub struct IndexedPage {
     pub text: Vec<char>,
     folded_title: Vec<char>,
     folded_text: Vec<char>,
+    /// `path_key(path)`, so that finding a page by path does not build a key per page.
+    key: Vec<String>,
+}
+
+/// Reads a page for the index; `None` when it cannot be read.
+fn read_indexed(path: &Path, place: String) -> Option<IndexedPage> {
+    let doc = read_doc(path).ok()?;
+    let title = doc.title_or(path);
+    let text: Vec<char> = crate::render::plain_text(&doc.body).chars().collect();
+    let folded_text: Vec<char> = text.iter().map(|c| fold_char(*c)).collect();
+    Some(IndexedPage {
+        place,
+        folded_title: fold(&title),
+        key: path_key(path),
+        path: path.to_path_buf(),
+        title,
+        text,
+        folded_text,
+    })
 }
 
 pub struct SearchHit {
@@ -616,7 +639,9 @@ impl Index {
                             stack.push(p);
                         }
                     } else if is_md(&p) {
-                        idx.add(&p);
+                        // Every file is listed once: no need to look for an older entry.
+                        let place = idx.place_of(&p);
+                        idx.pages.extend(read_indexed(&p, place));
                     }
                 }
             }
@@ -626,28 +651,19 @@ impl Index {
 
     pub fn add(&mut self, path: &Path) {
         self.remove(path);
-        let Ok(doc) = read_doc(path) else { return };
-        let title = doc.title_or(path);
-        let plain = crate::render::plain_text(&doc.body);
-        let text: Vec<char> = plain.chars().collect();
-        let folded_text: Vec<char> = text.iter().map(|c| fold_char(*c)).collect();
-        self.pages.push(IndexedPage {
-            place: self.place_of(path),
-            folded_title: fold(&title),
-            path: path.to_path_buf(),
-            title,
-            text,
-            folded_text,
-        });
+        let place = self.place_of(path);
+        self.pages.extend(read_indexed(path, place));
     }
 
     pub fn remove(&mut self, path: &Path) {
-        self.pages.retain(|p| !same_path(&p.path, path));
+        let key = path_key(path);
+        self.pages.retain(|p| p.key != key);
     }
 
     /// Removes everything at or below `path` (a deleted or renamed folder).
     pub fn remove_tree(&mut self, path: &Path) {
-        self.pages.retain(|p| !is_within(&p.path, path));
+        let dir = path_key(path);
+        self.pages.retain(|p| !key_within(&p.key, &dir));
     }
 
     /// Indexes every page at or below `path` (replacing what was indexed there); reads each file once.
@@ -662,10 +678,12 @@ impl Index {
     /// Follows a file or folder that was moved or renamed from `from` to `to` without reading any
     /// file: the pages at or below `from` get their new path and place. Titles stay as they were.
     pub fn relocate(&mut self, from: &Path, to: &Path) {
-        let roots = &self.roots;
+        let (roots, dir, skip) = (&self.roots, path_key(from), from.components().count());
         for p in &mut self.pages {
-            if let Some(new) = rebase(&p.path, from, to) {
+            if key_within(&p.key, &dir) {
+                let new = to.join(p.path.components().skip(skip).collect::<PathBuf>());
                 p.place = place_in(roots, new.parent().unwrap_or(Path::new("")));
+                p.key = path_key(&new);
                 p.path = new;
             }
         }
@@ -962,6 +980,14 @@ mod tests {
         idx.add_tree(&moved);
         assert_eq!(idx.pages.len(), 5);
         assert!(idx.search("fresh", 10).iter().any(|h| h.place == "B › Soups"));
+
+        // Paths are found without case, also after a relocate (the stored key follows the path).
+        let late_now = moved.join(late.file_name().unwrap());
+        idx.remove(Path::new(&late_now.to_string_lossy().to_uppercase()));
+        assert_eq!(idx.pages.len(), 4);
+        idx.remove_tree(Path::new(&moved.to_string_lossy().to_lowercase()));
+        // Left: the loose page in A and the trout in B › Fish.
+        assert_eq!(idx.pages.len(), 2);
         let _ = fs::remove_dir_all(&base);
     }
 

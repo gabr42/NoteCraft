@@ -235,19 +235,12 @@ impl NoteApp {
         if !mover::can_move_section_to(folder, target) {
             return Ok(());
         }
-        let mut left_behind = Vec::new();
-        let op = || mover::move_section(folder, target).map(|m| m.map(|m| {
-            left_behind = m.left_behind;
-            m.path
-        }));
-        let Some(new) = self.relocate_folder(folder, op)? else {
+        let Some(mover::Moved { path: new, left_behind }) = self.relocate_folder(folder, || mover::move_section(folder, target))? else {
             return Ok(());
         };
         // `new` carries the final name ("Name (2)" after a name clash).
         self.set_status(format!("Moved section \"{}\" to {}", folder_name(&new), self.index.place_of(&new)));
         if !left_behind.is_empty() {
-            // What could not be removed is still there and still found.
-            self.index.add_tree(folder);
             let text = left_behind_text(&format!("The section \"{}\"", folder_name(&new)), &left_behind);
             self.show_message("Move section", text);
         }
@@ -289,7 +282,7 @@ impl NoteApp {
                     let pages = win.pages.entry(f.path.clone()).or_insert_with(|| store::list_pages(&f.path, SortOrder::Name)).clone();
                     for pg in &pages {
                         let target = store::subpage_dir(&pg.path);
-                        let ok = mover::can_move_to(&win.item, &target) && pg.path != win.item;
+                        let ok = mover::can_move_to(&win.item, &target) && !store::same_path(&pg.path, &win.item);
                         let selected = win.selected.as_ref() == Some(&target);
                         ui.horizontal(|ui| {
                             ui.add_space(14.0 * pg.level as f32);

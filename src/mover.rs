@@ -135,7 +135,13 @@ fn remove_best_effort(p: &Path, left: &mut Vec<PathBuf>) {
         let mut perm = meta.permissions();
         #[allow(clippy::permissions_set_readonly_false)]
         perm.set_readonly(false);
-        removed = fs::set_permissions(p, perm).and_then(|_| fs::remove_file(p)).is_ok();
+        if fs::set_permissions(p, perm).is_ok() {
+            removed = fs::remove_file(p).is_ok();
+            if !removed {
+                // It stays behind: keep its protection.
+                let _ = fs::set_permissions(p, meta.permissions());
+            }
+        }
     }
     if !removed {
         left.push(p.to_path_buf());
@@ -144,25 +150,42 @@ fn remove_best_effort(p: &Path, left: &mut Vec<PathBuf>) {
 
 /// Copies a file or a whole folder to `to`, then removes the original. Returns what of the original
 /// could not be removed; the move counts as done then (the copy is complete).
+/// What is already at `to` is kept: a file there with the same bytes counts as copied (the undo of a
+/// move finds the originals that stayed behind), a file with other bytes is an error. When the copy
+/// fails, only what this call created is removed again.
 fn copy_then_remove(from: &Path, to: &Path) -> std::io::Result<Vec<PathBuf>> {
-    fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    fn copy_tree(from: &Path, to: &Path, created: &mut Vec<PathBuf>) -> std::io::Result<()> {
         if from.is_dir() {
-            fs::create_dir_all(to)?;
+            if !to.is_dir() {
+                fs::create_dir(to)?;
+                created.push(to.to_path_buf());
+            }
             for e in fs::read_dir(from)? {
                 let e = e?;
-                copy_tree(&e.path(), &to.join(e.file_name()))?;
+                copy_tree(&e.path(), &to.join(e.file_name()), created)?;
+            }
+        } else if to.exists() {
+            if !same_bytes(from, to) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("{} already exists with other content", to.display()),
+                ));
             }
         } else {
-            if let Some(p) = to.parent() {
-                fs::create_dir_all(p)?;
-            }
             fs::copy(from, to)?;
+            created.push(to.to_path_buf());
         }
         Ok(())
     }
-    if let Err(e) = copy_tree(from, to) {
-        // Leave nothing half-copied behind.
-        let _ = if to.is_dir() { fs::remove_dir_all(to) } else { fs::remove_file(to) };
+    if let Some(p) = to.parent() {
+        fs::create_dir_all(p)?;
+    }
+    let mut created = Vec::new();
+    if let Err(e) = copy_tree(from, to, &mut created) {
+        // Leave nothing half-copied behind, but never touch what was there before.
+        for p in created.iter().rev() {
+            let _ = if p.is_dir() { fs::remove_dir(p) } else { fs::remove_file(p) };
+        }
         return Err(e);
     }
     // The copy is complete: the move counts as done even when some originals cannot be removed.
@@ -187,12 +210,12 @@ fn is_md(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("md"))
 }
 
-use crate::store::is_within;
+use crate::store::{is_within, same_path};
 
 /// Whether `page` may be moved into `target_dir`: not its own folder, not its subpage folder or below.
 pub fn can_move_to(page: &Path, target_dir: &Path) -> bool {
     let Some(dir) = page.parent() else { return false };
-    crate::store::path_key(dir) != crate::store::path_key(target_dir)
+    !same_path(dir, target_dir)
         && !is_within(target_dir, &crate::store::subpage_dir(page))
 }
 
@@ -256,7 +279,7 @@ pub fn move_page(page: &Path, target_dir: &Path) -> Result<Option<Moved>, String
     use crate::history::versions_dir;
     use crate::store::{file_stem, subpage_dir};
     let src_dir = page.parent().ok_or("The page has no folder.")?;
-    if crate::store::path_key(src_dir) == crate::store::path_key(target_dir) {
+    if same_path(src_dir, target_dir) {
         return Ok(None);
     }
     if !can_move_to(page, target_dir) {
@@ -315,12 +338,7 @@ pub fn move_page(page: &Path, target_dir: &Path) -> Result<Option<Moved>, String
         }
         match move_path(from, to) {
             Ok(left) => left_behind.extend(left),
-            Err(e) => {
-                for (f, t) in moves[..i].iter().rev() {
-                    let _ = move_path(t, f);
-                }
-                return Err(e);
-            }
+            Err(e) => return Err(undo_moves(&moves[..i], e)),
         }
     }
 
@@ -343,7 +361,10 @@ pub fn move_page(page: &Path, target_dir: &Path) -> Result<Option<Moved>, String
     if let Some(linked) = names_still_linked(src_dir) {
         for n in copied {
             if !linked.iter().any(|l| same_name(l, &n)) {
-                let _ = fs::remove_file(src_res.join(&n));
+                let orig = src_res.join(&n);
+                if fs::remove_file(&orig).is_err() && orig.exists() {
+                    left_behind.push(orig);
+                }
             }
         }
     }
@@ -351,10 +372,33 @@ pub fn move_page(page: &Path, target_dir: &Path) -> Result<Option<Moved>, String
     Ok(Some(Moved { path: new, left_behind }))
 }
 
+/// Moves `done` (pairs of from, to) back in reverse order after the move that failed with `error`.
+/// Returns `error`, extended with what the undo could not do, so that nothing goes unreported.
+fn undo_moves(done: &[(PathBuf, PathBuf)], error: String) -> String {
+    let mut msg = error;
+    for (from, to) in done.iter().rev() {
+        match move_path(to, from) {
+            Ok(left) if left.is_empty() => {}
+            Ok(left) => {
+                msg.push_str("\n\nThe move was undone, but these copies could not be removed from the new place:");
+                for p in left {
+                    msg.push_str(&format!("\n{}", p.display()));
+                }
+            }
+            Err(e) => msg.push_str(&format!(
+                "\n\nThe move could not be undone for {}: {e}\nIt is kept at {}.",
+                from.display(),
+                to.display()
+            )),
+        }
+    }
+    msg
+}
+
 /// Whether the section `folder` may be moved into `target`: not its current parent, not itself or below it.
 pub fn can_move_section_to(folder: &Path, target: &Path) -> bool {
     let Some(parent) = folder.parent() else { return false };
-    crate::store::path_key(parent) != crate::store::path_key(target) && !is_within(target, folder)
+    !same_path(parent, target) && !is_within(target, folder)
 }
 
 /// Moves a section folder (with its pages, pictures and history, which all live inside it) into
@@ -364,7 +408,7 @@ pub fn move_section(folder: &Path, target: &Path) -> Result<Option<Moved>, Strin
     if is_within(target, folder) {
         return Err("A section cannot be moved into itself.".into());
     }
-    if folder.parent().is_none_or(|p| crate::store::path_key(p) == crate::store::path_key(target)) {
+    if folder.parent().is_none_or(|p| same_path(p, target)) {
         return Ok(None);
     }
     let new = target.join(free_stem(target, &name));
@@ -826,6 +870,98 @@ mod tests {
         drop(guard);
         assert!(!to.exists());
         assert!(from.join("a.md").is_file() && from.join("b.md").is_file());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn copy_back_over_leftovers_keeps_them() {
+        // The undo of a cross-drive move: the original folder still holds a file that stayed behind.
+        let d = temp("copy-back");
+        let (moved, orig) = (d.join("moved"), d.join("orig"));
+        fs::create_dir_all(&moved).unwrap();
+        fs::create_dir_all(&orig).unwrap();
+        fs::write(moved.join("a.md"), "A").unwrap();
+        fs::write(moved.join("x.md"), "X").unwrap();
+        fs::write(orig.join("x.md"), "X").unwrap();
+        assert!(copy_then_remove(&moved, &orig).unwrap().is_empty());
+        assert!(!moved.exists());
+        assert_eq!(fs::read_to_string(orig.join("a.md")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(orig.join("x.md")).unwrap(), "X");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn failed_copy_back_never_removes_what_was_there() {
+        let d = temp("copy-back-fails");
+        let (moved, orig) = (d.join("moved"), d.join("orig"));
+        fs::create_dir_all(&moved).unwrap();
+        fs::create_dir_all(&orig).unwrap();
+        fs::write(moved.join("a.md"), "A").unwrap();
+        fs::write(moved.join("x.md"), "NEW").unwrap();
+        fs::write(orig.join("x.md"), "OLD").unwrap();
+        fs::write(orig.join("keep.md"), "K").unwrap();
+        assert!(copy_then_remove(&moved, &orig).is_err());
+        // The original folder is as it was; the moved copy is untouched.
+        assert_eq!(fs::read_to_string(orig.join("x.md")).unwrap(), "OLD");
+        assert_eq!(fs::read_to_string(orig.join("keep.md")).unwrap(), "K");
+        assert!(!orig.join("a.md").exists());
+        assert!(moved.join("a.md").is_file() && moved.join("x.md").is_file());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn undo_reports_what_it_could_not_do() {
+        let d = temp("undo-report");
+        // Nothing at the new place to move back.
+        let msg = undo_moves(&[(d.join("from.md"), d.join("gone.md"))], "First error".into());
+        assert!(msg.starts_with("First error"));
+        assert!(msg.contains("could not be undone") && msg.contains("gone.md"));
+        // A successful undo adds nothing.
+        fs::write(d.join("to.md"), "T").unwrap();
+        assert_eq!(undo_moves(&[(d.join("back.md"), d.join("to.md"))], "E".into()), "E");
+        assert!(d.join("back.md").is_file());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_only_file_left_behind_stays_read_only() {
+        let d = temp("read-only-left");
+        let f = d.join("a.md");
+        fs::write(&f, "A").unwrap();
+        let mut perm = fs::metadata(&f).unwrap().permissions();
+        perm.set_readonly(true);
+        fs::set_permissions(&f, perm).unwrap();
+        let guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new().read(true).share_mode(1).open(&f).unwrap()
+        };
+        let mut left = Vec::new();
+        remove_best_effort(&f, &mut left);
+        drop(guard);
+        assert_eq!(left, vec![f.clone()]);
+        assert!(fs::metadata(&f).unwrap().permissions().readonly());
+        let mut perm = fs::metadata(&f).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        let _ = fs::set_permissions(&f, perm);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn picture_that_cannot_be_removed_is_reported() {
+        let (d, a, b) = notebook("pic-locked");
+        let p = page_with(&a, "P", "![](resources/x.png)");
+        let orig = pic(&a, "x.png", b"X");
+        let guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new().read(true).share_mode(1).open(&orig).unwrap()
+        };
+        let moved = move_page(&p, &b).unwrap().unwrap();
+        drop(guard);
+        assert_eq!(moved.left_behind, vec![orig.clone()]);
+        assert!(b.join("resources").join("x.png").is_file());
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -94,7 +94,9 @@ A section cannot be moved into itself or one of its own subsections.
 
 A move to another drive copies first and removes the originals afterwards. When a file there cannot
 be removed (it is open in another program), the move still counts as done and NoteCraft lists the
-files that stayed behind, so you can delete them later.
+files that stayed behind, so you can delete them later. When a later step of a page move fails, the
+parts already moved are moved back; anything that could not be moved back stays at the new place,
+and the error message says where.
 
 Folders can also be given on the command line: `NoteCraft.exe "U:\Notes" "D:\More notes"`.
 Removing a folder from the view (**Folders ▸ Remove … from view**) never touches its files.
