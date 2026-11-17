@@ -1782,12 +1782,22 @@ impl NoteApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let sc = |k: Key| KeyboardShortcut::new(Modifiers::COMMAND, k);
+        // Undo/redo of note management. Text fields, the page editor and every window keep their own
+        // Ctrl+Z, so the keys are consumed only when none of them is active.
+        let undo_ok = self.mode != Mode::Edit
+            && !ctx.egui_wants_keyboard_input()
+            && self.dialog.is_none()
+            && self.import_win.is_none()
+            && self.move_win.is_none()
+            && self.history_win.is_none()
+            && self.deleted_win.is_none()
+            && self.history_view.is_none();
         let (redo_shift, redo_y, undo_z, find, save, edit, new, print, refresh, esc) = ctx.input_mut(|i| {
             (
                 // Ctrl+Shift+Z first: egui matches modifiers loosely, so Ctrl+Z would also take it.
-                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)),
-                i.consume_shortcut(&sc(Key::Y)),
-                i.consume_shortcut(&sc(Key::Z)),
+                undo_ok && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)),
+                undo_ok && i.consume_shortcut(&sc(Key::Y)),
+                undo_ok && i.consume_shortcut(&sc(Key::Z)),
                 i.consume_shortcut(&sc(Key::F)),
                 i.consume_shortcut(&sc(Key::S)),
                 i.consume_shortcut(&sc(Key::E)),
@@ -1800,18 +1810,10 @@ impl NoteApp {
         if self.dialog.is_some() || self.import_win.is_some() || self.move_win.is_some() {
             return;
         }
-        // Undo/redo of note management; text fields, the page editor and every window keep their own Ctrl+Z.
-        let undo_ok = self.mode != Mode::Edit
-            && ctx.memory(|m| m.focused().is_none())
-            && self.history_win.is_none()
-            && self.deleted_win.is_none()
-            && self.history_view.is_none();
-        if undo_ok {
-            if redo_shift || redo_y {
-                self.actions.push(Action::Redo);
-            } else if undo_z {
-                self.actions.push(Action::Undo);
-            }
+        if redo_shift || redo_y {
+            self.actions.push(Action::Redo);
+        } else if undo_z {
+            self.actions.push(Action::Undo);
         }
         if find {
             self.focus_search = true;
