@@ -135,7 +135,10 @@ could not be saved by `release_open_page`, or when the operation failed because 
 
 Operations return an `OpError` (`src/op_error.rs`) whose `Kind` decides this:
 - `Busy` - a file system call failed with sharing violation, lock violation or access denied
-  (Windows reports a folder holding an open file as access denied): the record stays.
+  (Windows reports a folder holding an open file as access denied): the record stays. Since a
+  folder with broken permissions also reports access denied, a record that fails as `Busy`
+  `undo::BUSY_TRIES` (3) times in a row is dropped (`UndoLog::return_busy`); the count restarts
+  after the step worked.
 - `Refused` - a name the step needs is taken: the record is dropped.
 - `Failed` - any other failure that changed nothing: the record is dropped.
 - `Partial` - the operation changed something and its rollback failed (or a restored page's

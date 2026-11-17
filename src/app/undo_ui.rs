@@ -13,7 +13,8 @@ const GONE: &str = "it is not there any more";
 #[derive(Debug, PartialEq)]
 enum StepError {
     /// Something that can pass (another computer edits the item, the open page could not be saved,
-    /// a file is in use): nothing changed and the record stays on its list.
+    /// a file is in use): nothing changed and the record stays on its list, up to `undo::BUSY_TRIES`
+    /// failures in a row.
     Busy(String),
     /// The step cannot be done (the item is gone, a name it needs is taken, the operation failed for
     /// another reason or only halfway): the record is dropped, so that older steps stay reachable.
@@ -209,8 +210,7 @@ impl NoteApp {
                 let text = format!("Cannot {verb} {}: {}", rec.label, e.text());
                 self.set_status(text.clone());
                 let sentence = if text.ends_with('.') { text.clone() } else { format!("{text}.") };
-                if matches!(e, StepError::Busy(_)) {
-                    if undoing { self.undo.return_undo(rec) } else { self.undo.return_redo(rec) }
+                if matches!(e, StepError::Busy(_)) && self.undo.return_busy(rec, undoing) {
                     self.show_message(&format!("Cannot {verb}"), sentence);
                 } else {
                     self.show_message(&format!("Cannot {verb}"), format!("{sentence}\n\nIt was removed from the {verb} list."));

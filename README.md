@@ -23,7 +23,10 @@ Windows 10/11 with the WebView2 runtime is required.
   Undo waits while a dialog or window is open; while you edit a page, Ctrl+Z undoes your typing.
   A step that can no longer be done (the item is gone, its old name is taken, or it failed) is
   explained and removed from the list; one that is only blocked for now (the page is being edited
-  on another computer, or a file is in use) stays on it and can be tried again.
+  on another computer, or a file is in use) stays on it and can be tried again, up to three times
+  in a row.
+- **Renaming a page** takes its subpages folder along. When that folder cannot be renamed (a file in
+  it is open), or a folder with the new name already exists, the page is not renamed either.
 - **Pictures.** Paste or drop a picture into a page; it is saved in a `resources` folder next to
   the page.
 - **Search.** One search box covers all open folders. Results show the notebook and section, the

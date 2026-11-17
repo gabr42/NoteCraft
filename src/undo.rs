@@ -29,9 +29,14 @@ impl Step {
     }
 }
 
+/// How often in a row a step may fail as busy before it is dropped (see `UndoLog::return_busy`).
+pub const BUSY_TRIES: u32 = 3;
+
 pub struct Record {
     pub step: Step,
     pub label: String,
+    /// How often in a row the step failed as busy; 0 after it worked.
+    pub busy_tries: u32,
 }
 
 #[derive(Default)]
@@ -64,13 +69,28 @@ impl UndoLog {
     }
 
     /// After a successful undo: the record goes onto the redo list.
-    pub fn undone(&mut self, r: Record) {
+    pub fn undone(&mut self, mut r: Record) {
+        r.busy_tries = 0;
         self.redo.push(r);
     }
 
     /// After a successful redo: the record goes back onto undo, redo is kept.
-    pub fn redone(&mut self, r: Record) {
+    pub fn redone(&mut self, mut r: Record) {
+        r.busy_tries = 0;
         self.push_capped(r);
+    }
+
+    /// After a step taken from the undo list (`undoing`) or the redo list failed as busy: puts it
+    /// back, unless this was its BUSY_TRIES-th busy failure in a row. Windows reports a folder with
+    /// broken permissions like one that is only in use ("access denied"), so without a limit such a
+    /// step would block the steps under it forever. Returns whether the record was put back.
+    pub fn return_busy(&mut self, mut r: Record, undoing: bool) -> bool {
+        r.busy_tries += 1;
+        if r.busy_tries >= BUSY_TRIES {
+            return false;
+        }
+        if undoing { self.return_undo(r) } else { self.return_redo(r) }
+        true
     }
 
     /// Puts a record taken with `take_undo` back unchanged (the step could not start).
@@ -105,6 +125,7 @@ mod tests {
         Record {
             step: Step::MoveSection { from: PathBuf::from("a"), to: PathBuf::from("b") },
             label: label.to_string(),
+            busy_tries: 0,
         }
     }
 
@@ -219,6 +240,41 @@ mod tests {
         log.return_undo(b);
         assert_eq!(log.undo_label(), Some("B"));
         assert_eq!(log.redo_label(), Some("A"));
+    }
+
+    /// A step that keeps failing as busy (a folder with broken permissions also reports "access
+    /// denied") is dropped on the BUSY_TRIES-th try, so that older steps stay reachable.
+    #[test]
+    fn return_busy_drops_after_tries() {
+        let mut log = UndoLog::default();
+        log.push(rec("A"));
+        log.push(rec("B"));
+        for _ in 1..BUSY_TRIES {
+            let b = log.take_undo().unwrap();
+            assert!(log.return_busy(b, true));
+            assert_eq!(log.undo_label(), Some("B"));
+        }
+        let b = log.take_undo().unwrap();
+        assert!(!log.return_busy(b, true));
+        assert_eq!(log.undo_label(), Some("A"));
+    }
+
+    /// A step that worked starts counting busy tries from zero again.
+    #[test]
+    fn return_busy_count_resets_after_success() {
+        let mut log = UndoLog::default();
+        log.push(rec("A"));
+        for _ in 1..BUSY_TRIES {
+            let a = log.take_undo().unwrap();
+            assert!(log.return_busy(a, true));
+        }
+        let a = log.take_undo().unwrap();
+        log.undone(a);
+        for _ in 1..BUSY_TRIES {
+            let a = log.take_redo().unwrap();
+            assert!(log.return_busy(a, false));
+            assert_eq!(log.redo_label(), Some("A"));
+        }
     }
 
     #[test]
