@@ -1,6 +1,7 @@
 //! Reading and writing the notes: folders are notebooks/sections, `.md` files are pages.
 //! A folder named like a page (`Page.md` + `Page/`) holds that page's subpages.
 
+use crate::op_error::{Kind, OpError};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -451,14 +452,14 @@ pub fn save_conflict_copy(path: &Path, body: &str, computer: &str) -> Result<Pat
 /// name; without it the name follows the title and the extension becomes `.md`.
 /// All or nothing: the title is written only after the file was renamed, and the file gets its old
 /// name back when that write fails.
-pub fn rename_page(path: &Path, new_title: &str, exact: Option<&Path>) -> Result<PathBuf, String> {
+pub fn rename_page(path: &Path, new_title: &str, exact: Option<&Path>) -> Result<PathBuf, OpError> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let stem = exact.map(file_stem);
     let ext = exact.map_or_else(|| "md".to_string(), page_ext);
     if let Some(why) = exact.and_then(|e| rename_refusal(path, e)) {
-        return Err(why);
+        return Err(OpError::refused(why));
     }
-    let mut doc = read_doc(path).map_err(|e| format!("Could not read the page: {e}"))?;
+    let mut doc = read_doc(path).map_err(|e| OpError::io(format!("Could not read the page: {e}"), &e))?;
     doc.set("title", new_title.trim());
     doc.set("updated", &now_stamp());
     let wanted = stem.clone().unwrap_or_else(|| safe_name(new_title));
@@ -471,13 +472,17 @@ pub fn rename_page(path: &Path, new_title: &str, exact: Option<&Path>) -> Result
         unique_path(dir, &wanted, "md")
     };
     if new_path != path {
-        fs::rename(path, &new_path).map_err(|e| format!("Could not rename the file: {e}"))?;
+        fs::rename(path, &new_path).map_err(|e| OpError::io(format!("Could not rename the file: {e}"), &e))?;
     }
     if let Err(e) = fs::write(&new_path, doc.to_text()) {
-        if new_path != path {
-            let _ = fs::rename(&new_path, path);
+        let err = OpError::io(format!("Could not save the page: {e}"), &e);
+        if new_path != path
+            && let Err(back) = fs::rename(&new_path, path)
+        {
+            let text = format!("{err}\n\nIt could not get its old name back: {back}\nIt is now {}.", new_path.display());
+            return Err(OpError::new(Kind::Partial, text));
         }
-        return Err(format!("Could not save the page: {e}"));
+        return Err(err);
     }
     if wanted == file_stem(path) {
         return Ok(new_path);
@@ -492,9 +497,9 @@ pub fn rename_page(path: &Path, new_title: &str, exact: Option<&Path>) -> Result
     Ok(new_path)
 }
 
-/// Why `rename_page` with `exact` would refuse: another page, or a folder that is not the page's own
-/// subpage folder, already has the stem of `exact`. Changes nothing.
-pub fn rename_refusal(path: &Path, exact: &Path) -> Option<String> {
+/// Why `rename_page` with `exact` refuses: another page, or a folder that is not the page's own
+/// subpage folder, already has the stem of `exact`.
+fn rename_refusal(path: &Path, exact: &Path) -> Option<String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let stem = file_stem(exact);
     let own = same_path(&dir.join(&stem), &dir.join(file_stem(path)));
@@ -506,7 +511,7 @@ pub fn rename_refusal(path: &Path, exact: &Path) -> Option<String> {
 }
 
 /// Deletes a page (with its subpages and versions) into the history of its folder.
-pub fn delete_page(path: &Path) -> Result<PathBuf, String> {
+pub fn delete_page(path: &Path) -> Result<PathBuf, OpError> {
     crate::history::delete_page(path, chrono::Local::now().naive_local())
 }
 
@@ -516,29 +521,23 @@ pub fn create_folder(parent: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-pub fn rename_folder(path: &Path, name: &str) -> Result<PathBuf, String> {
+/// Renames a section folder to `name`; refused when something else already has that name (a change
+/// of case only, also of a non-ASCII letter, is allowed).
+pub fn rename_folder(path: &Path, name: &str) -> Result<PathBuf, OpError> {
     let parent = path.parent().ok_or("This folder cannot be renamed")?;
     let new_path = parent.join(safe_name(name));
     if new_path == path {
         return Ok(new_path);
     }
-    if let Some(why) = folder_rename_refusal(path, name) {
-        return Err(why);
+    if new_path.exists() && !same_path(&new_path, path) {
+        return Err(OpError::refused(format!("A section named \"{}\" already exists here.", safe_name(name))));
     }
-    fs::rename(path, &new_path).map_err(|e| format!("Could not rename the section: {e}"))?;
+    fs::rename(path, &new_path).map_err(|e| OpError::io(format!("Could not rename the section: {e}"), &e))?;
     Ok(new_path)
 }
 
-/// Why `rename_folder` would refuse: something else already has the name (a change of case only is
-/// allowed). Changes nothing.
-pub fn folder_rename_refusal(path: &Path, name: &str) -> Option<String> {
-    let new_path = path.parent()?.join(safe_name(name));
-    (new_path != path && new_path.exists() && !safe_name(name).eq_ignore_ascii_case(&file_stem(path)))
-        .then(|| format!("A section named \"{}\" already exists here.", safe_name(name)))
-}
-
 /// Deletes a section into the history of its parent folder.
-pub fn delete_folder(path: &Path) -> Result<PathBuf, String> {
+pub fn delete_folder(path: &Path) -> Result<PathBuf, OpError> {
     crate::history::delete_folder(path, chrono::Local::now().naive_local())
 }
 
@@ -945,6 +944,17 @@ mod tests {
         fs::write(&page, "---\ntitle: Čaj\n---\n\ntext\n").unwrap();
         let renamed = rename_page(&page, "čaj", Some(Path::new("čaj.md"))).unwrap();
         assert_eq!(renamed.file_name().unwrap(), "čaj.md");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_folder_case_only_non_ascii() {
+        let root = temp_root("renfolderunicode");
+        let sec = root.join("čaj");
+        fs::create_dir_all(&sec).unwrap();
+        assert_eq!(rename_folder(&sec, "Čaj").unwrap(), root.join("Čaj"));
+        fs::create_dir_all(root.join("Kava")).unwrap();
+        assert_eq!(rename_folder(&root.join("Čaj"), "kava").unwrap_err().kind, Kind::Refused);
         let _ = fs::remove_dir_all(&root);
     }
 

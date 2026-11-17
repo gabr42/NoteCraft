@@ -21,10 +21,9 @@ Windows 10/11 with the WebView2 runtime is required.
 - **Undo.** Moves, renames, deletions and creations of pages and sections can be undone and
   redone (Ctrl+Z / Ctrl+Y or the ↶ ↷ buttons) during the session; the last 20 actions are kept.
   Undo waits while a dialog or window is open; while you edit a page, Ctrl+Z undoes your typing.
-  A step that can no longer be done (the item is gone, or its old name is taken) is removed from the
-  list; one that fails for now (the item is in use or a file is locked) stays and can be tried again.
-  A step that is no longer possible is explained and removed from the list; one that is only
-  blocked for now (the page is being edited on another computer) stays on it.
+  A step that can no longer be done (the item is gone, its old name is taken, or it failed) is
+  explained and removed from the list; one that is only blocked for now (the page is being edited
+  on another computer, or a file is in use) stays on it and can be tried again.
 - **Pictures.** Paste or drop a picture into a page; it is saved in a `resources` folder next to
   the page.
 - **Search.** One search box covers all open folders. Results show the notebook and section, the

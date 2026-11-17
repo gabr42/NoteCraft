@@ -356,7 +356,7 @@ impl NoteApp {
     /// Restores the deleted item kept in a `deleted\<time>` folder (from a search hit).
     fn restore_deleted_entry(&mut self, entry: &Path) -> Result<String, String> {
         let item = history::deleted_item_at(entry).ok_or_else(|| "The deleted item is not there any more.".to_string())?;
-        let path = history::restore_deleted(&item, false)?;
+        let path = history::restore_deleted(&item, false).inspect_err(|e| self.after_partial(e))?;
         self.after_restore_deleted(&item, &path);
         Ok(restored_message(&item, &path))
     }
@@ -372,7 +372,15 @@ impl NoteApp {
                 win.items.remove(i);
                 win.select(None);
             }
-            Err(e) => win.message = e,
+            Err(e) => {
+                self.after_partial(&e);
+                if e.kind == Kind::Partial {
+                    // It is back, only some of its versions stayed in the history.
+                    win.items.remove(i);
+                    win.select(None);
+                }
+                win.message = e.text;
+            }
         }
     }
 

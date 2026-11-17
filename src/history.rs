@@ -3,6 +3,7 @@
 //! See docs/superpowers/specs/2026-11-04-history-design.md. Only `fs::copy` and `fs::rename` within
 //! one volume are used, so this works on network drives. Nothing is deleted automatically.
 
+use crate::op_error::{Kind, OpError};
 use chrono::NaiveDateTime;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -116,16 +117,16 @@ pub fn rename_versions(old_page: &Path, new_page: &Path) -> Result<(), String> {
     }
     // A rename that only changes the case names the same folder on Windows.
     if from.to_string_lossy().to_lowercase() == to.to_string_lossy().to_lowercase() {
-        return move_to(&from, &to);
+        return Ok(move_to(&from, &to)?);
     }
     if to.exists() {
-        return merge_dir(&from, &to);
+        return Ok(merge_dir(&from, &to)?);
     }
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("history::rename_versions: could not create {}: {e}", parent.display()))?;
     }
-    move_to(&from, &to)
+    Ok(move_to(&from, &to)?)
 }
 
 /// Removes all saved versions of a page.
@@ -166,7 +167,7 @@ fn deleted_root(folder: &Path) -> PathBuf {
 }
 
 /// A new `deleted\<time>` folder for something deleted from `folder`.
-fn new_entry(folder: &Path, now: NaiveDateTime) -> Result<PathBuf, String> {
+fn new_entry(folder: &Path, now: NaiveDateTime) -> Result<PathBuf, OpError> {
     let stamp = now.format(TIME_FORMAT).to_string();
     let root = deleted_root(folder);
     let mut entry = root.join(&stamp);
@@ -176,24 +177,35 @@ fn new_entry(folder: &Path, now: NaiveDateTime) -> Result<PathBuf, String> {
         n += 1;
     }
     std::fs::create_dir_all(&entry)
-        .map_err(|e| format!("history: could not create the history folder {}: {e}", entry.display()))?;
+        .map_err(|e| OpError::io(format!("history: could not create the history folder {}: {e}", entry.display()), &e))?;
     Ok(entry)
 }
 
-fn move_to(from: &Path, to: &Path) -> Result<(), String> {
+fn move_to(from: &Path, to: &Path) -> Result<(), OpError> {
     std::fs::rename(from, to)
-        .map_err(|e| format!("history: could not move {} to {}: {e}", from.display(), to.display()))
+        .map_err(|e| OpError::io(format!("history: could not move {} to {}: {e}", from.display(), to.display()), &e))
 }
 
 /// Moves each `(from, to)` pair in order; when one fails, the earlier ones are moved back and the
-/// (empty) entry folder is removed.
-fn move_all(moves: &[(PathBuf, PathBuf)], entry: &Path) -> Result<(), String> {
+/// (empty) entry folder is removed. When moving back fails too, the error is `Partial` and says
+/// where the item is kept.
+fn move_all(moves: &[(PathBuf, PathBuf)], entry: &Path) -> Result<(), OpError> {
     for (i, (from, to)) in moves.iter().enumerate() {
-        if let Err(e) = move_to(from, to) {
+        if let Err(mut e) = move_to(from, to) {
             for (f, t) in moves[..i].iter().rev() {
-                let _ = std::fs::rename(t, f);
+                if let Err(back) = std::fs::rename(t, f) {
+                    e = OpError::new(
+                        Kind::Partial,
+                        format!("{}
+
+It could not be moved back to {}: {back}
+It is kept at {}.", e.text, f.display(), t.display()),
+                    );
+                }
             }
-            let _ = std::fs::remove_dir(entry);
+            if e.kind != Kind::Partial {
+                let _ = std::fs::remove_dir(entry);
+            }
             return Err(e);
         }
     }
@@ -202,7 +214,7 @@ fn move_all(moves: &[(PathBuf, PathBuf)], entry: &Path) -> Result<(), String> {
 
 /// Moves a page, its subpages folder and its versions into the `.history\deleted` of its folder.
 /// Returns the entry folder.
-pub fn delete_page(page: &Path, now: NaiveDateTime) -> Result<PathBuf, String> {
+pub fn delete_page(page: &Path, now: NaiveDateTime) -> Result<PathBuf, OpError> {
     let folder = page.parent().ok_or("history::delete_page: the page has no folder")?;
     let name = page.file_name().ok_or("history::delete_page: the page has no name")?;
     let entry = new_entry(folder, now)?;
@@ -220,7 +232,7 @@ pub fn delete_page(page: &Path, now: NaiveDateTime) -> Result<PathBuf, String> {
 }
 
 /// Moves a folder into the `.history\deleted` of its parent. Returns the entry folder.
-pub fn delete_folder(folder: &Path, now: NaiveDateTime) -> Result<PathBuf, String> {
+pub fn delete_folder(folder: &Path, now: NaiveDateTime) -> Result<PathBuf, OpError> {
     let parent = folder.parent().ok_or("history::delete_folder: a top-level folder cannot be deleted")?;
     let name = folder.file_name().ok_or("history::delete_folder: the folder has no name")?;
     let entry = new_entry(parent, now)?;
@@ -310,9 +322,9 @@ fn free_name(folder: &Path, stem: &str) -> String {
 }
 
 /// Moves the files of `from` into `to`, giving a numbered name to a file that is already there.
-fn merge_dir(from: &Path, to: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(to).map_err(|e| format!("history: could not create {}: {e}", to.display()))?;
-    for e in std::fs::read_dir(from).map_err(|e| format!("history: could not read {}: {e}", from.display()))?.flatten() {
+fn merge_dir(from: &Path, to: &Path) -> Result<(), OpError> {
+    std::fs::create_dir_all(to).map_err(|e| OpError::io(format!("history: could not create {}: {e}", to.display()), &e))?;
+    for e in std::fs::read_dir(from).map_err(|e| OpError::io(format!("history: could not read {}: {e}", from.display()), &e))?.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         // A number goes before the extension so that the file is still recognised as a version.
         let (stem, ext) = match name.rfind('.') {
@@ -332,15 +344,16 @@ fn merge_dir(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// Puts a deleted item back into the folder it came from (created if it is gone). A name that is
-/// taken gets a number, or with `exact` makes this fail before anything moves. Returns the path of
-/// the restored page or folder.
-pub fn restore_deleted(item: &DeletedItem, exact: bool) -> Result<PathBuf, String> {
+/// taken gets a number, or with `exact` makes this fail (`Refused`) before anything moves. Returns
+/// the path of the restored page or folder. When the page is back but its versions could not all be
+/// merged with the ones already there, the error is `Partial`: the rest stays in the entry.
+pub fn restore_deleted(item: &DeletedItem, exact: bool) -> Result<PathBuf, OpError> {
     let folder = &item.original_folder;
-    if let Some(why) = exact.then(|| exact_restore_refusal(item)).flatten() {
-        return Err(why);
+    if exact && free_name(folder, &item.name) != item.name {
+        return Err(OpError::refused(format!("\"{}\" already has \"{}\".", folder.display(), item.name)));
     }
     std::fs::create_dir_all(folder)
-        .map_err(|e| format!("history::restore_deleted: could not create {}: {e}", folder.display()))?;
+        .map_err(|e| OpError::io(format!("history::restore_deleted: could not create {}: {e}", folder.display()), &e))?;
     let restored = match item.kind {
         ItemKind::Section => {
             let name = free_name(folder, &item.name);
@@ -368,28 +381,26 @@ pub fn restore_deleted(item: &DeletedItem, exact: bool) -> Result<PathBuf, Strin
                 } else {
                     if let Some(parent) = new_versions.parent() {
                         std::fs::create_dir_all(parent).map_err(|e| {
-                            format!("history::restore_deleted: could not create {}: {e}", parent.display())
+                            OpError::io(format!("history::restore_deleted: could not create {}: {e}", parent.display()), &e)
                         })?;
                     }
                     moves.push((versions.clone(), new_versions.clone()));
                 }
             }
             move_all(&moves, &item.entry)?;
-            if merge {
-                merge_dir(&versions, &new_versions)?;
+            if merge
+                && let Err(e) = merge_dir(&versions, &new_versions)
+            {
+                return Err(OpError::new(
+                    Kind::Partial,
+                    format!("The page is back at {}, but some of its versions stayed in {}: {e}", target.display(), item.entry.display()),
+                ));
             }
             target
         }
     };
     let _ = std::fs::remove_dir(&item.entry);
     Ok(restored)
-}
-
-/// Why `restore_deleted` with `exact` would refuse: the old name of the item is taken. Changes nothing.
-pub fn exact_restore_refusal(item: &DeletedItem) -> Option<String> {
-    let folder = &item.original_folder;
-    (free_name(folder, &item.name) != item.name)
-        .then(|| format!("\"{}\" already has \"{}\".", folder.display(), item.name))
 }
 
 /// Removes a deleted item from the history for good.
@@ -787,7 +798,6 @@ mod tests {
         let entry = delete_folder(&s, at(9, 0)).unwrap();
         let item = deleted_item_at(&entry).unwrap();
         assert_eq!(item.kind, ItemKind::Section);
-        assert_eq!(exact_restore_refusal(&item), None);
         let back = restore_deleted(&item, true).unwrap();
         assert_eq!(back, s);
         assert!(s.join("P.md").is_file() && !entry.exists());
@@ -804,8 +814,7 @@ mod tests {
         // A page with the section's name takes it too.
         let newer = page_with(&top, "S.md", "\nnew\n");
         let item = deleted_item_at(&entry).unwrap();
-        assert!(exact_restore_refusal(&item).is_some());
-        assert!(restore_deleted(&item, true).is_err());
+        assert_eq!(restore_deleted(&item, true).unwrap_err().kind, Kind::Refused);
         assert!(entry.is_dir() && !s.exists());
         assert!(fs::read_to_string(&newer).unwrap().contains("new"));
         assert_eq!(restore_deleted(&item, false).unwrap(), top.join("S (2)"));
@@ -921,7 +930,8 @@ mod tests {
         let sub = page_with(&top.join("A"), "Sub.md", "sub");
         let _open = fs::File::open(&sub).unwrap(); // an open file keeps Windows from moving the folder
         let e = delete_page(&p, at(9, 0)).unwrap_err();
-        assert!(e.contains("history"), "{e}");
+        assert!(e.text.contains("history"), "{e}");
+        assert_eq!(e.kind, Kind::Busy, "{e}");
         assert!(p.is_file() && sub.is_file());
         assert!(list_deleted(&top).is_empty());
         assert!(!top.join(HISTORY_DIR).join("deleted").join("2026-11-04T090000").exists());
@@ -1095,6 +1105,27 @@ mod tests {
         let back = restore_deleted(&item, false).unwrap();
         assert_eq!(back, p);
         assert!(p.is_file());
+        let _ = fs::remove_dir_all(&top);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_with_unmergeable_versions_is_partial() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let top = temp("restore-partial");
+        let p = page_with(&top, "P.md", "text");
+        snapshot_now(&p, at(9, 0)).unwrap();
+        let entry = delete_page(&p, at(9, 5)).unwrap();
+        let item = deleted_item_at(&entry).unwrap();
+        // The page has versions again, so the old ones are merged; one of them is locked.
+        fs::create_dir_all(versions_dir(&p)).unwrap();
+        let old = fs::read_dir(entry.join(VERSIONS_IN_ENTRY)).unwrap().flatten().next().unwrap().path();
+        let guard = fs::OpenOptions::new().read(true).share_mode(0).open(&old).unwrap();
+        let e = restore_deleted(&item, false).unwrap_err();
+        drop(guard);
+        assert_eq!(e.kind, Kind::Partial, "{e}");
+        assert!(p.is_file(), "the page is back");
+        assert!(old.is_file(), "the locked version stays in the entry");
         let _ = fs::remove_dir_all(&top);
     }
 

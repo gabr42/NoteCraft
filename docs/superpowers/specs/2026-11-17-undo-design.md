@@ -122,15 +122,25 @@ the list stays) when:
    asks for the stem/name in `to` (including any "(2)" the first action gave) and is refused, not
    numbered, when that is taken. Names compare without case, so a case-only rename back
    (`budget` → `Budget`) is the item's own name, not a clash.
-3. It, or a page inside it, is being edited on another computer (`page_free` / `folder_free`).
-4. Its place is no longer in an open top-level folder (removed from view).
+3. Its place is no longer in an open top-level folder (removed from view).
 
 *(My call: drop the record rather than keep it, so the next Ctrl+Z does not hit the same wall.)*
-The open page is saved and released first with `release_open_page`, exactly like a move; if the
-save fails, nothing happens and the record stays.
+Check 2 is made by the operation itself (`move_page` / `move_section` with exact names,
+`rename_page` / `rename_folder`, `restore_deleted` with `exact`), which refuses before it changes
+anything; there is no separate pre-check.
 
-If the operation itself then fails half-way, the existing rollback in `mover` / `history` applies and
-its message is shown as today; the record is dropped and the tree reloaded.
+The record **stays** on its list (nothing changed, a later try can work) when the item, or a page
+inside it, is being edited on another computer (`page_free` / `folder_free`), when the open page
+could not be saved by `release_open_page`, or when the operation failed because a file is in use.
+
+Operations return an `OpError` (`src/op_error.rs`) whose `Kind` decides this:
+- `Busy` - a file system call failed with sharing violation, lock violation or access denied
+  (Windows reports a folder holding an open file as access denied): the record stays.
+- `Refused` - a name the step needs is taken: the record is dropped.
+- `Failed` - any other failure that changed nothing: the record is dropped.
+- `Partial` - the operation changed something and its rollback failed (or a restored page's
+  versions could not all be merged): the message says where the item is, the tree is reloaded and
+  the index rebuilt (`after_partial`), and the record is dropped.
 
 ### Doing the step
 
