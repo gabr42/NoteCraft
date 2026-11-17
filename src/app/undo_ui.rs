@@ -149,9 +149,14 @@ impl NoteApp {
                 if undoing { self.undo.undone(rec) } else { self.undo.redone(rec) }
             }
             Err(e) => {
-                self.set_status(format!("Cannot {verb} {}: {e}", rec.label));
+                let text = format!("Cannot {verb} {}: {e}", rec.label);
+                self.set_status(text.clone());
+                let sentence = if text.ends_with('.') { text.clone() } else { format!("{text}.") };
                 if e == SAVE_FAILED {
                     if undoing { self.undo.return_undo(rec) } else { self.undo.return_redo(rec) }
+                    self.show_message(&format!("Cannot {verb}"), sentence);
+                } else {
+                    self.show_message(&format!("Cannot {verb}"), format!("{sentence}\n\nIt was removed from the {verb} list."));
                 }
             }
         }

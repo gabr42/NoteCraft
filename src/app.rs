@@ -970,7 +970,6 @@ impl NoteApp {
                     if ui.add(top_button("⟳")).hover_fx().on_hover_text("Reload notes from disk (F5)").clicked() {
                         self.actions.push(Action::Refresh);
                     }
-                    ui.add_space(8.0);
                     let redo_label = self.undo.redo_label().map(str::to_string);
                     let redo_btn = ui.add_enabled(redo_label.is_some(), top_button("↷")).hover_fx();
                     let redo_btn = match &redo_label {
