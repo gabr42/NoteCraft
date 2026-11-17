@@ -296,11 +296,10 @@ pub fn deleted_item_at(entry: &Path) -> Option<DeletedItem> {
 }
 
 /// A name based on `stem` for which neither `<name>.md`, `<name>.markdown` nor a folder `<name>`
-/// exists in `folder` (the file system ignores case).
-fn free_name(folder: &Path, stem: &str, page: bool) -> String {
-    let taken = |n: &str| {
-        folder.join(n).exists() || (page && ["md", "markdown"].iter().any(|e| folder.join(format!("{n}.{e}")).exists()))
-    };
+/// exists in `folder` (the file system ignores case). Holds for sections too: a folder next to a page
+/// of the same name would be that page's subpage folder.
+fn free_name(folder: &Path, stem: &str) -> String {
+    let taken = |n: &str| folder.join(n).exists() || ["md", "markdown"].iter().any(|e| folder.join(format!("{n}.{e}")).exists());
     let mut name = stem.to_string();
     let mut n = 2;
     while taken(&name) {
@@ -337,20 +336,20 @@ fn merge_dir(from: &Path, to: &Path) -> Result<(), String> {
 /// the restored page or folder.
 pub fn restore_deleted(item: &DeletedItem, exact: bool) -> Result<PathBuf, String> {
     let folder = &item.original_folder;
-    if exact && free_name(folder, &item.name, item.kind == ItemKind::Page) != item.name {
-        return Err(format!("\"{}\" already has \"{}\".", folder.display(), item.name));
+    if let Some(why) = exact.then(|| exact_restore_refusal(item)).flatten() {
+        return Err(why);
     }
     std::fs::create_dir_all(folder)
         .map_err(|e| format!("history::restore_deleted: could not create {}: {e}", folder.display()))?;
     let restored = match item.kind {
         ItemKind::Section => {
-            let name = free_name(folder, &item.name, false);
+            let name = free_name(folder, &item.name);
             let target = folder.join(&name);
             move_to(&item.entry.join(&item.name), &target)?;
             target
         }
         ItemKind::Page => {
-            let name = free_name(folder, &item.name, true);
+            let name = free_name(folder, &item.name);
             let ext = Path::new(&item.file).extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
             let target = folder.join(format!("{name}{ext}"));
             let mut moves = vec![(item.entry.join(&item.file), target.clone())];
@@ -384,6 +383,13 @@ pub fn restore_deleted(item: &DeletedItem, exact: bool) -> Result<PathBuf, Strin
     };
     let _ = std::fs::remove_dir(&item.entry);
     Ok(restored)
+}
+
+/// Why `restore_deleted` with `exact` would refuse: the old name of the item is taken. Changes nothing.
+pub fn exact_restore_refusal(item: &DeletedItem) -> Option<String> {
+    let folder = &item.original_folder;
+    (free_name(folder, &item.name) != item.name)
+        .then(|| format!("\"{}\" already has \"{}\".", folder.display(), item.name))
 }
 
 /// Removes a deleted item from the history for good.
@@ -624,11 +630,7 @@ mod tests {
 
     /// What a save does to the file on disk, without going through `store::save_body`.
     fn set_body(p: &Path, body: &str) {
-        fs::write(p, format!("---
-title: T
-updated: 2026-01-02T00:00:00
----
-{body}")).unwrap();
+        fs::write(p, format!("---\ntitle: T\nupdated: 2026-01-02T00:00:00\n---\n{body}")).unwrap();
     }
 
     #[test]
@@ -749,13 +751,9 @@ updated: 2026-01-02T00:00:00
     #[test]
     fn restore_exact_refuses_taken() {
         let top = temp("restexact");
-        let p = page_with(&top, "P.md", "
-old
-");
+        let p = page_with(&top, "P.md", "\nold\n");
         let entry = delete_page(&p, at(9, 0)).unwrap();
-        page_with(&top, "P.md", "
-new
-");
+        page_with(&top, "P.md", "\nnew\n");
         let item = deleted_item_at(&entry).unwrap();
         assert!(restore_deleted(&item, true).is_err());
         assert!(entry.is_dir());
@@ -767,13 +765,9 @@ new
     #[test]
     fn restore_exact_refuses_taken_markdown() {
         let top = temp("restexactmd");
-        let p = page_with(&top, "P.md", "
-old
-");
+        let p = page_with(&top, "P.md", "\nold\n");
         let entry = delete_page(&p, at(9, 0)).unwrap();
-        let newer = page_with(&top, "P.markdown", "
-new
-");
+        let newer = page_with(&top, "P.markdown", "\nnew\n");
         let item = deleted_item_at(&entry).unwrap();
         assert!(restore_deleted(&item, true).is_err());
         assert!(entry.is_dir());
@@ -781,6 +775,54 @@ new
         let back = restore_deleted(&item, false).unwrap();
         assert_eq!(back, top.join("P (2).md"));
         assert!(fs::read_to_string(&newer).unwrap().contains("new"));
+        let _ = fs::remove_dir_all(&top);
+    }
+
+    #[test]
+    fn restore_exact_section() {
+        let top = temp("restexactsec");
+        let s = top.join("S");
+        fs::create_dir_all(&s).unwrap();
+        page_with(&s, "P.md", "\nold\n");
+        let entry = delete_folder(&s, at(9, 0)).unwrap();
+        let item = deleted_item_at(&entry).unwrap();
+        assert_eq!(item.kind, ItemKind::Section);
+        assert_eq!(exact_restore_refusal(&item), None);
+        let back = restore_deleted(&item, true).unwrap();
+        assert_eq!(back, s);
+        assert!(s.join("P.md").is_file() && !entry.exists());
+        let _ = fs::remove_dir_all(&top);
+    }
+
+    #[test]
+    fn restore_exact_section_refuses_taken() {
+        let top = temp("restexactsectaken");
+        let s = top.join("S");
+        fs::create_dir_all(&s).unwrap();
+        page_with(&s, "P.md", "\nold\n");
+        let entry = delete_folder(&s, at(9, 0)).unwrap();
+        // A page with the section's name takes it too.
+        let newer = page_with(&top, "S.md", "\nnew\n");
+        let item = deleted_item_at(&entry).unwrap();
+        assert!(exact_restore_refusal(&item).is_some());
+        assert!(restore_deleted(&item, true).is_err());
+        assert!(entry.is_dir() && !s.exists());
+        assert!(fs::read_to_string(&newer).unwrap().contains("new"));
+        assert_eq!(restore_deleted(&item, false).unwrap(), top.join("S (2)"));
+        let _ = fs::remove_dir_all(&top);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_exact_section_refuses_other_case() {
+        let top = temp("restexactseccase");
+        let s = top.join("S");
+        fs::create_dir_all(&s).unwrap();
+        let entry = delete_folder(&s, at(9, 0)).unwrap();
+        fs::create_dir_all(top.join("s")).unwrap();
+        let item = deleted_item_at(&entry).unwrap();
+        assert!(restore_deleted(&item, true).is_err());
+        assert!(entry.is_dir());
         let _ = fs::remove_dir_all(&top);
     }
 

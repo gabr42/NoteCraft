@@ -1964,8 +1964,9 @@ impl NoteApp {
                         }
                     }
                     "refresh" => self.actions.push(Action::Refresh),
-                    "undo" => self.actions.push(Action::Undo),
-                    "redo" => self.actions.push(Action::Redo),
+                    // While editing, Ctrl+Z belongs to the editor (as in `shortcuts`).
+                    "undo" if self.mode != Mode::Edit => self.actions.push(Action::Undo),
+                    "redo" if self.mode != Mode::Edit => self.actions.push(Action::Redo),
                     _ => {}
                 },
                 WebMsg::Image { mime, data } => self.save_pasted_image(&mime, &data),

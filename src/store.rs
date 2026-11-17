@@ -455,15 +455,8 @@ pub fn rename_page(path: &Path, new_title: &str, exact: Option<&Path>) -> Result
     let dir = path.parent().unwrap_or(Path::new("."));
     let stem = exact.map(file_stem);
     let ext = exact.map_or_else(|| "md".to_string(), page_ext);
-    if let Some(stem) = &stem {
-        let own = same_path(&dir.join(stem), &dir.join(file_stem(path)));
-        let page_taken = ["md", "markdown"].iter().any(|ext| {
-            let other = dir.join(format!("{stem}.{ext}"));
-            other.exists() && !same_path(&other, path)
-        });
-        if page_taken || (!own && dir.join(stem).exists()) {
-            return Err(format!("\"{}\" already has \"{stem}\".", dir.display()));
-        }
+    if let Some(why) = exact.and_then(|e| rename_refusal(path, e)) {
+        return Err(why);
     }
     let mut doc = read_doc(path).map_err(|e| format!("Could not read the page: {e}"))?;
     doc.set("title", new_title.trim());
@@ -499,6 +492,19 @@ pub fn rename_page(path: &Path, new_title: &str, exact: Option<&Path>) -> Result
     Ok(new_path)
 }
 
+/// Why `rename_page` with `exact` would refuse: another page, or a folder that is not the page's own
+/// subpage folder, already has the stem of `exact`. Changes nothing.
+pub fn rename_refusal(path: &Path, exact: &Path) -> Option<String> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let stem = file_stem(exact);
+    let own = same_path(&dir.join(&stem), &dir.join(file_stem(path)));
+    let page_taken = ["md", "markdown"].iter().any(|ext| {
+        let other = dir.join(format!("{stem}.{ext}"));
+        other.exists() && !same_path(&other, path)
+    });
+    (page_taken || (!own && dir.join(&stem).exists())).then(|| format!("\"{}\" already has \"{stem}\".", dir.display()))
+}
+
 /// Deletes a page (with its subpages and versions) into the history of its folder.
 pub fn delete_page(path: &Path) -> Result<PathBuf, String> {
     crate::history::delete_page(path, chrono::Local::now().naive_local())
@@ -516,11 +522,19 @@ pub fn rename_folder(path: &Path, name: &str) -> Result<PathBuf, String> {
     if new_path == path {
         return Ok(new_path);
     }
-    if new_path.exists() && !safe_name(name).eq_ignore_ascii_case(&file_stem(path)) {
-        return Err(format!("A section named \"{}\" already exists here.", safe_name(name)));
+    if let Some(why) = folder_rename_refusal(path, name) {
+        return Err(why);
     }
     fs::rename(path, &new_path).map_err(|e| format!("Could not rename the section: {e}"))?;
     Ok(new_path)
+}
+
+/// Why `rename_folder` would refuse: something else already has the name (a change of case only is
+/// allowed). Changes nothing.
+pub fn folder_rename_refusal(path: &Path, name: &str) -> Option<String> {
+    let new_path = path.parent()?.join(safe_name(name));
+    (new_path != path && new_path.exists() && !safe_name(name).eq_ignore_ascii_case(&file_stem(path)))
+        .then(|| format!("A section named \"{}\" already exists here.", safe_name(name)))
 }
 
 /// Deletes a section into the history of its parent folder.
@@ -900,15 +914,8 @@ mod tests {
     fn rename_page_exact_stem() {
         let root = temp_root("renexact");
         let page = root.join("Odd name (2).md");
-        fs::write(&page, "---
-title: Odd
----
-
-text
-").unwrap();
-        save_body(&page, "
-more text
-").unwrap();
+        fs::write(&page, "---\ntitle: Odd\n---\n\ntext\n").unwrap();
+        save_body(&page, "\nmore text\n").unwrap();
         let renamed = rename_page(&page, "New", None).unwrap();
         assert_eq!(renamed.file_name().unwrap(), "New.md");
         let back = rename_page(&renamed, "Odd", Some(Path::new("Odd name (2).md"))).unwrap();
@@ -935,12 +942,7 @@ more text
     fn rename_page_exact_case_only_non_ascii() {
         let root = temp_root("renunicode");
         let page = root.join("Čaj.md");
-        fs::write(&page, "---
-title: Čaj
----
-
-text
-").unwrap();
+        fs::write(&page, "---\ntitle: Čaj\n---\n\ntext\n").unwrap();
         let renamed = rename_page(&page, "čaj", Some(Path::new("čaj.md"))).unwrap();
         assert_eq!(renamed.file_name().unwrap(), "čaj.md");
         let _ = fs::remove_dir_all(&root);
@@ -950,12 +952,7 @@ text
     fn rename_page_exact_keeps_markdown_extension() {
         let root = temp_root("renkeepext");
         let page = root.join("X.markdown");
-        fs::write(&page, "---
-title: X
----
-
-text
-").unwrap();
+        fs::write(&page, "---\ntitle: X\n---\n\ntext\n").unwrap();
         let renamed = rename_page(&page, "Y", None).unwrap();
         assert_eq!(renamed, root.join("Y.md"));
         let back = rename_page(&renamed, "X", Some(Path::new("X.markdown"))).unwrap();
@@ -985,10 +982,7 @@ text
     fn rename_page_exact_refuses_markdown_extension() {
         let root = temp_root("renmarkdown");
         let a = create_page(&root, "A").unwrap();
-        fs::write(root.join("B.markdown"), "---
-title: B
----
-").unwrap();
+        fs::write(root.join("B.markdown"), "---\ntitle: B\n---\n").unwrap();
         let before = fs::read(&a).unwrap();
         assert!(rename_page(&a, "B", Some(Path::new("B.md"))).is_err());
         assert_eq!(fs::read(&a).unwrap(), before);

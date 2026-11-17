@@ -305,6 +305,104 @@ fn names_still_linked(dir: &Path) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// The refusal when `target_dir` already has a page (or folder) named `stem`.
+fn stem_refusal(target_dir: &Path, stem: &str) -> Option<String> {
+    (free_stem(target_dir, stem) != stem).then(|| format!("\"{}\" already has a page named \"{stem}\".", display_name(target_dir)))
+}
+
+/// Picture names the page and its versions link, each once, in the order they first appear.
+fn linked_pictures(page: &Path) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = Vec::new();
+    for f in std::iter::once(page.to_path_buf()).chain(files_under(&crate::history::versions_dir(page))) {
+        let text = fs::read_to_string(&f).map_err(|e| format!("Could not read {}: {e}", f.display()))?;
+        for n in picture_links(&text) {
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// Plans the linked pictures (`names`) of a page moving from `src_res` to `dst_res`: (source name,
+/// target name, what happens to it). Pictures that are not there are skipped. Reads but writes
+/// nothing; fails only when the `exact` names cannot be given.
+fn plan_pictures(
+    names: Vec<String>,
+    src_res: &Path,
+    dst_res: &Path,
+    exact: Option<&Exact>,
+    target_name: &str,
+) -> Result<Vec<(String, String, Pic)>, String> {
+    let mut plan: Vec<(String, String, Pic)> = Vec::new();
+    for n in names {
+        let src = src_res.join(&n);
+        if !src.is_file() {
+            continue;
+        }
+        let wanted = exact
+            .and_then(|e| e.pictures.iter().find(|(from, _)| same_name(from, &n)))
+            .map_or_else(|| n.clone(), |(_, to)| to.clone());
+        let dst = dst_res.join(&wanted);
+        // The source of a picture this move already copies under the wanted name.
+        let first = plan.iter().find(|(_, t, a)| *a == Pic::Copy && same_name(t, &wanted)).map(|(f, _, _)| f.clone());
+        match &first {
+            Some(f) if same_bytes(&src, &src_res.join(f)) => {
+                plan.push((n, wanted, Pic::Shared));
+                continue;
+            }
+            None if dst.exists() && same_bytes(&src, &dst) => {
+                plan.push((n, wanted, Pic::Kept));
+                continue;
+            }
+            _ => {}
+        }
+        let target = if dst.exists() || first.is_some() {
+            if exact.is_some() {
+                return Err(if first.is_some() {
+                    format!("Two different pictures would both be named \"{wanted}\" in \"{target_name}\".")
+                } else {
+                    format!("\"{target_name}\" already has a different picture named \"{wanted}\".")
+                });
+            }
+            let taken: Vec<String> = plan.iter().filter(|(_, _, a)| *a == Pic::Copy).map(|(_, t, _)| t.clone()).collect();
+            free_picture_name(dst_res, &n, &taken)
+        } else {
+            wanted
+        };
+        plan.push((n, target, Pic::Copy));
+    }
+    Ok(plan)
+}
+
+/// Why `move_page` with `exact` would refuse to move `page` into `target_dir` (a page or picture name
+/// there is taken), checked without changing anything. `None` also when the page cannot be read:
+/// that is left to the move itself.
+pub fn exact_refusal(page: &Path, target_dir: &Path, exact: &Exact) -> Option<String> {
+    if let Some(why) = stem_refusal(target_dir, &exact.stem) {
+        return Some(why);
+    }
+    let src_dir = page.parent()?;
+    let names = linked_pictures(page).ok()?;
+    plan_pictures(names, &src_dir.join("resources"), &target_dir.join("resources"), Some(exact), &display_name(target_dir)).err()
+}
+
+/// The refusal when `target` already has a section (or page) named `name`.
+pub fn section_refusal(target: &Path, name: &str) -> Option<String> {
+    (free_stem(target, name) != name).then(|| format!("\"{}\" already has a section named \"{name}\".", display_name(target)))
+}
+
+/// What `move_page` does with one picture the page links.
+#[derive(Clone, Copy, PartialEq)]
+enum Pic {
+    /// Copied into the target `resources`.
+    Copy,
+    /// The target already had a picture with that name and the same bytes; it stays there on undo.
+    Kept,
+    /// Same bytes as another picture this move copies to the same name: it uses that copy.
+    Shared,
+}
+
 /// Moves `page` into `target_dir` (a section folder, or the subpage folder of another page) with its
 /// subpages, versions and pictures. Pictures are copied first; an original is deleted only after the
 /// move succeeded and when nothing left in the source folder still links it.
@@ -324,8 +422,8 @@ pub fn move_page(page: &Path, target_dir: &Path, exact: Option<&Exact>) -> Resul
     let target_name = display_name(target_dir);
     let stem = match exact {
         Some(e) => {
-            if free_stem(target_dir, &e.stem) != e.stem {
-                return Err(format!("\"{target_name}\" already has a page named \"{}\".", e.stem));
+            if let Some(why) = stem_refusal(target_dir, &e.stem) {
+                return Err(why);
             }
             e.stem.clone()
         }
@@ -336,57 +434,30 @@ pub fn move_page(page: &Path, target_dir: &Path, exact: Option<&Exact>) -> Resul
 
     // 1. Plan the pictures the page and its versions link (all exact checks happen here), then copy them.
     let versions = versions_dir(page);
-    let mut names: Vec<String> = Vec::new();
-    for f in std::iter::once(page.to_path_buf()).chain(files_under(&versions)) {
-        let text = fs::read_to_string(&f).map_err(|e| format!("Could not read {}: {e}", f.display()))?;
-        for n in picture_links(&text) {
-            if !names.contains(&n) {
-                names.push(n);
-            }
-        }
-    }
     let (src_res, dst_res) = (src_dir.join("resources"), target_dir.join("resources"));
-    // (source name, target name, whether the file still has to be copied)
-    let mut plan: Vec<(String, String, bool)> = Vec::new();
-    let mut taken: Vec<String> = Vec::new();
-    for n in names {
-        let src = src_res.join(&n);
-        if !src.is_file() {
-            continue;
+    let plan = plan_pictures(linked_pictures(page)?, &src_res, &dst_res, exact, &target_name)?;
+    let res_was_there = dst_res.is_dir();
+    // Removes the first `upto` copies this move made (and the `resources` folder it created) after a
+    // failure, so that nothing of the failed move stays in the target.
+    let remove_copies = |upto: usize| {
+        for (_, target, _) in plan.iter().filter(|(_, _, a)| *a == Pic::Copy).take(upto) {
+            let _ = fs::remove_file(dst_res.join(target));
         }
-        let wanted = exact
-            .and_then(|e| e.pictures.iter().find(|(from, _)| same_name(from, &n)))
-            .map_or_else(|| n.clone(), |(_, to)| to.clone());
-        let dst = dst_res.join(&wanted);
-        let clash = taken.iter().any(|t| same_name(t, &wanted));
-        if dst.exists() && !clash && same_bytes(&src, &dst) {
-            plan.push((n, wanted, false));
-            continue;
+        if !res_was_there {
+            let _ = fs::remove_dir(&dst_res);
         }
-        let target = if dst.exists() || clash {
-            if exact.is_some() {
-                return Err(format!("\"{target_name}\" already has a different picture named \"{wanted}\"."));
-            }
-            free_picture_name(&dst_res, &n, &taken)
-        } else {
-            wanted
-        };
-        taken.push(target.clone());
-        plan.push((n, target, true));
-    }
-    for (n, target, copy) in &plan {
-        if !copy {
-            continue;
+    };
+    for (i, (n, target, _)) in plan.iter().filter(|(_, _, a)| *a == Pic::Copy).enumerate() {
+        if let Err(e) = fs::create_dir_all(&dst_res).and_then(|_| fs::copy(src_res.join(n), dst_res.join(target))) {
+            remove_copies(i);
+            return Err(format!("Could not copy the picture {n} to {}: {e}", dst_res.display()));
         }
-        fs::create_dir_all(&dst_res)
-            .and_then(|_| fs::copy(src_res.join(n), dst_res.join(target)))
-            .map_err(|e| format!("Could not copy the picture {n} to {}: {e}", dst_res.display()))?;
     }
     let renames: Vec<(String, String)> = plan.iter().filter(|(n, t, _)| n != t).map(|(n, t, _)| (n.clone(), t.clone())).collect();
-    let kept: Vec<String> = plan.iter().filter(|(_, _, copy)| !copy).map(|(_, t, _)| t.clone()).collect();
+    let kept: Vec<String> = plan.iter().filter(|(_, _, a)| *a == Pic::Kept).map(|(_, t, _)| t.clone()).collect();
     let keep: &[String] = exact.map_or(&[], |e| e.keep.as_slice());
     // The originals to remove once the page is moved.
-    let copied: Vec<String> = plan.into_iter().map(|(n, _, _)| n).filter(|n| !keep.iter().any(|k| same_name(k, n))).collect();
+    let copied: Vec<String> = plan.iter().map(|(n, _, _)| n.clone()).filter(|n| !keep.iter().any(|k| same_name(k, n))).collect();
 
     // 2. Move the page, its subpages and its versions; undo on failure.
     let mut moves = vec![(page.to_path_buf(), new.clone())];
@@ -403,7 +474,10 @@ pub fn move_page(page: &Path, target_dir: &Path, exact: Option<&Exact>) -> Resul
         }
         match move_path(from, to) {
             Ok(left) => left_behind.extend(left),
-            Err(e) => return Err(undo_moves(&moves[..i], e)),
+            Err(e) => {
+                remove_copies(usize::MAX);
+                return Err(undo_moves(&moves[..i], e));
+            }
         }
     }
 
@@ -476,8 +550,8 @@ pub fn move_section(folder: &Path, target: &Path, name: Option<&str>) -> Result<
     }
     let new = match name {
         Some(n) => {
-            if free_stem(target, n) != n {
-                return Err(format!("\"{}\" already has a section named \"{n}\".", display_name(target)));
+            if let Some(why) = section_refusal(target, n) {
+                return Err(why);
             }
             target.join(n)
         }
@@ -907,12 +981,7 @@ mod tests {
     fn exact_move_keeps_markdown_extension() {
         let (d, a, b) = notebook("exact-markdown");
         let p = a.join("X.markdown");
-        fs::write(&p, "---
-title: X
----
-
-text
-").unwrap();
+        fs::write(&p, "---\ntitle: X\n---\n\ntext\n").unwrap();
         let new = move_page(&p, &b, None).unwrap().unwrap().path;
         assert_eq!(new, b.join("X.md"));
         let exact = Exact { stem: "X".into(), ext: "markdown".into(), pictures: Vec::new(), keep: Vec::new() };
@@ -985,6 +1054,106 @@ text
         let err = move_page(&p, &b, Some(&exact)).err().unwrap();
         assert!(err.contains("already has a different picture named \"x.png\""), "{err}");
         assert_eq!((listing(&a), listing(&b)), (before_a, before_b));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn exact_shares_identical_pictures_wanting_one_name() {
+        let (d, a, b) = notebook("exact-share");
+        let p = page_with(&a, "P", "![](resources/a.png) ![](resources/b.png)");
+        pic(&a, "a.png", b"SAME");
+        pic(&a, "b.png", b"SAME");
+        let pictures = vec![("a.png".into(), "x.png".into()), ("b.png".into(), "x.png".into())];
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures, keep: Vec::new() };
+        let moved = move_page(&p, &b, Some(&exact)).unwrap().unwrap();
+        assert_eq!(listing(&b.join("resources")), vec![b.join("resources").join("x.png")]);
+        assert_eq!(fs::read(b.join("resources").join("x.png")).unwrap(), b"SAME");
+        let text = fs::read_to_string(&moved.path).unwrap();
+        assert_eq!(picture_links(&text), vec!["x.png".to_string()], "{text}");
+        assert!(moved.kept.is_empty());
+        assert!(!a.join("resources").join("a.png").exists() && !a.join("resources").join("b.png").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn exact_refuses_different_pictures_wanting_one_name() {
+        let (d, a, b) = notebook("exact-two");
+        let p = page_with(&a, "P", "![](resources/a.png) ![](resources/b.png)");
+        pic(&a, "a.png", b"ONE");
+        pic(&a, "b.png", b"TWO");
+        let (before_a, before_b) = (listing(&a), listing(&b));
+        let pictures = vec![("a.png".into(), "x.png".into()), ("b.png".into(), "x.png".into())];
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures, keep: Vec::new() };
+        let err = move_page(&p, &b, Some(&exact)).err().unwrap();
+        assert!(err.contains("Two different pictures would both be named \"x.png\""), "{err}");
+        assert_eq!((listing(&a), listing(&b)), (before_a, before_b));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn exact_uses_target_picture_with_same_bytes() {
+        let (d, a, b) = notebook("exact-same-bytes");
+        let p = page_with(&a, "P", "![](resources/x-2.png)");
+        pic(&a, "x-2.png", b"SAME");
+        pic(&b, "x.png", b"SAME");
+        let exact = Exact { stem: "P".into(), ext: "md".into(), pictures: vec![("x-2.png".into(), "x.png".into())], keep: Vec::new() };
+        let moved = move_page(&p, &b, Some(&exact)).unwrap().unwrap();
+        assert_eq!(moved.kept, vec!["x.png".to_string()]);
+        assert_eq!(moved.pictures, vec![("x-2.png".to_string(), "x.png".to_string())]);
+        assert!(fs::read_to_string(&moved.path).unwrap().contains("](resources/x.png)"));
+        assert_eq!(listing(&b.join("resources")), vec![b.join("resources").join("x.png")]);
+        assert!(!a.join("resources").join("x-2.png").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn exact_refusal_matches_the_move() {
+        let (d, a, b) = notebook("exact-refusal");
+        let p = page_with(&a, "P", "![](resources/x-2.png)");
+        pic(&a, "x-2.png", b"MINE");
+        pic(&b, "x.png", b"THEIRS");
+        let before = (listing(&a), listing(&b));
+        let pics = Exact { stem: "P".into(), ext: "md".into(), pictures: vec![("x-2.png".into(), "x.png".into())], keep: Vec::new() };
+        let why = exact_refusal(&p, &b, &pics).unwrap();
+        assert_eq!(Some(why), move_page(&p, &b, Some(&pics)).err());
+        page_with(&b, "Q", "other");
+        let stem = Exact { stem: "Q".into(), ext: "md".into(), pictures: Vec::new(), keep: Vec::new() };
+        assert!(exact_refusal(&p, &b, &stem).unwrap().contains("already has a page named \"Q\""));
+        let free = Exact { stem: "P".into(), ext: "md".into(), pictures: Vec::new(), keep: Vec::new() };
+        assert_eq!(exact_refusal(&p, &b, &free), None);
+        assert_eq!(listing(&a), before.0);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_move_removes_its_picture_copies() {
+        let (d, a, b) = notebook("pic-rollback");
+        let p = page_with(&a, "P", "![](resources/x.png)");
+        pic(&a, "x.png", b"X");
+        // Readable (the pictures are planned and copied) but not renamable (the page move fails).
+        let guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new().read(true).share_mode(1).open(&p).unwrap()
+        };
+        assert!(move_page(&p, &b, None).is_err());
+        drop(guard);
+        assert!(!b.join("resources").exists(), "{:?}", listing(&b));
+        assert!(p.is_file() && a.join("resources").join("x.png").is_file());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section_name_clash_ignores_case() {
+        let (d, a, b) = notebook("sec-case");
+        fs::create_dir_all(b.join("a")).unwrap();
+        page_with(&a, "P", "text");
+        let err = move_section(&a, &b, Some("A")).err().unwrap();
+        assert!(err.contains("already has a section named \"A\""), "{err}");
+        assert!(a.join("P.md").is_file());
+        assert_eq!(move_section_to(&a, &b).unwrap().unwrap(), b.join("A (2)"));
+        assert!(b.join("A (2)").join("P.md").is_file() && b.join("a").is_dir());
         let _ = fs::remove_dir_all(&d);
     }
 
