@@ -337,16 +337,16 @@ impl<'a> Converter<'a> {
             }
             let mut t = t;
             let mut link: Option<String> = None;
-            if t.contains('\u{FDDF}') {
-                if let Some(c) = HYPERLINK_RE.captures(&t) {
-                    let l = c[1].to_string();
-                    let m = c.get(0).unwrap();
-                    t = format!("{}{}", &t[..m.start()], &t[m.end()..]).replace('\u{FDDF}', "");
-                    if t.is_empty() {
-                        t = l.clone();
-                    }
-                    link = Some(l).filter(|l| !l.is_empty());
+            if t.contains('\u{FDDF}')
+                && let Some(c) = HYPERLINK_RE.captures(&t)
+            {
+                let l = c[1].to_string();
+                let m = c.get(0).unwrap();
+                t = format!("{}{}", &t[..m.start()], &t[m.end()..]).replace('\u{FDDF}', "");
+                if t.is_empty() {
+                    t = l.clone();
                 }
+                link = Some(l).filter(|l| !l.is_empty());
             }
             t = t
                 .replace("\r\n", "\n")
