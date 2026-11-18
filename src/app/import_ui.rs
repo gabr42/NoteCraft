@@ -21,6 +21,9 @@ pub enum Step {
     Run,
 }
 
+/// A check running on its own thread: the input it was started for and the receiver of its result.
+type Pending<K, T> = (K, mpsc::Receiver<Result<T, String>>);
+
 /// The wizard window.
 pub struct ImportWin {
     step: Step,
@@ -39,9 +42,9 @@ pub struct ImportWin {
     /// The notebook folder in `target` exists and holds anything (so the user is asked first).
     target_not_empty: bool,
     /// The count running on its own thread, for this source text.
-    counting: Option<(String, mpsc::Receiver<Result<(usize, usize), String>>)>,
+    counting: Option<Pending<String, (usize, usize)>>,
     /// The target check running on its own thread, for this (source, target) text.
-    checking: Option<((String, String), mpsc::Receiver<Result<(PathBuf, bool), String>>)>,
+    checking: Option<Pending<(String, String), (PathBuf, bool)>>,
     /// The question about a non-empty notebook folder is showing.
     confirm: bool,
     /// The notebook folder the user already agreed to write into (asked once per wizard).

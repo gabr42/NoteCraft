@@ -239,11 +239,13 @@ const MAX_EMPTY_ARRAY: usize = 65_536;
 /// bounded by the data, but nested arrays multiply; this keeps a crafted set from exhausting memory.
 const MAX_PROPSET_VALUES: usize = 1 << 20;
 
+/// One id stream of a property set: (ids, position after it, extended flag, no-osid flag).
+type IdStream = (Vec<Option<ObjId>>, usize, bool, bool);
+
 /// Reads the property set at `pos`: the object, object space and context id streams,
 /// then the properties. `cid` turns a raw compact id into an object id.
 pub fn read_propset(r: &Rd, pos: usize, cid: &dyn Fn(u32) -> Option<ObjId>) -> Result<PropSet, String> {
-    // One id stream: (ids, position after it, extended flag, no-osid flag).
-    let stream = |pos: usize| -> Result<(Vec<Option<ObjId>>, usize, bool, bool), String> {
+    let stream = |pos: usize| -> Result<IdStream, String> {
         let v = r.u32_at(pos)?;
         let cnt = (v & 0xFF_FFFF) as usize;
         let raw = r.bytes(pos + 4, cnt * 4)?;
