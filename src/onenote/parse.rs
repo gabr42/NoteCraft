@@ -602,10 +602,11 @@ impl Parser<'_> {
         // An object space manifest list may hold several revision manifest list references;
         // "all but the last MUST be ignored" (MS-ONESTORE 2.1.6, 2.1.10). Followed while this
         // list is still active, so a reference back to it is caught as a loop.
-        if let Some((s, c)) = self.rev_list_ref.take() {
-            if res.is_ok() {
-                res = self.read_list(s, c, depth + 1);
-            }
+        // take() first: the reference must be cleared even when the list failed
+        if let Some((s, c)) = self.rev_list_ref.take()
+            && res.is_ok()
+        {
+            res = self.read_list(s, c, depth + 1);
         }
         self.rev_list_ref = outer;
         for c in chain {
