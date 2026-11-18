@@ -594,8 +594,8 @@ impl Parser<'_> {
         let mut chain = Vec::new();
         let mut res = self.read_chain(stp, cb, depth, &mut chain);
         // An object space manifest list may hold several revision manifest list references;
-        // only the last one is used. Followed while this list is still active, so a reference
-        // back to it is caught as a loop.
+        // "all but the last MUST be ignored" (MS-ONESTORE 2.1.6, 2.1.10). Followed while this
+        // list is still active, so a reference back to it is caught as a loop.
         if let Some((s, c)) = self.rev_list_ref.take() {
             if res.is_ok() {
                 res = self.read_list(s, c, depth + 1);
