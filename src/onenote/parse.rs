@@ -505,6 +505,9 @@ struct Parser<'a> {
     /// Lists being read now, to stop reference cycles.
     active: HashSet<(u64, u64)>,
     nodes: u64,
+    /// Last revision manifest list reference seen in the object space manifest list being read.
+    /// Only the last one is followed; earlier ones are stale (often zero) references.
+    rev_list_ref: Option<(u64, u64)>,
 }
 
 fn us(v: u64) -> Result<usize, String> {
@@ -531,6 +534,7 @@ impl OneFile {
             dep_table: HashMap::new(),
             active: HashSet::new(),
             nodes: 0,
+            rev_list_ref: None,
         };
         let stp = r.u64_at(172)?;
         let cb = r.u32_at(180)? as u64;
@@ -586,8 +590,18 @@ impl Parser<'_> {
         if depth > MAX_LIST_DEPTH {
             return Err("file node lists are nested too deeply".to_string());
         }
+        let outer = self.rev_list_ref.take();
         let mut chain = Vec::new();
-        let res = self.read_chain(stp, cb, depth, &mut chain);
+        let mut res = self.read_chain(stp, cb, depth, &mut chain);
+        // An object space manifest list may hold several revision manifest list references;
+        // "all but the last MUST be ignored" (MS-ONESTORE 2.1.6, 2.1.10). Followed while this
+        // list is still active, so a reference back to it is caught as a loop.
+        if let Some((s, c)) = self.rev_list_ref.take() {
+            if res.is_ok() {
+                res = self.read_list(s, c, depth + 1);
+            }
+        }
+        self.rev_list_ref = outer;
         for c in chain {
             self.active.remove(&c);
         }
@@ -635,7 +649,12 @@ impl Parser<'_> {
             // ObjectGroupListReference, FileDataStoreListReference
             0x08 | 0x10 | 0xB0 | 0x90 => {
                 let (s, c, _) = fcr(&r, pos, stp_f, cb_f)?;
-                self.read_list(s, c, depth + 1)?;
+                match (c, fid) {
+                    (0, _) => {} // fcrZero or fcrNil: no list
+                    // RevisionManifestListReference: followed at the end of the list (see read_list)
+                    (_, 0x10) => self.rev_list_ref = Some((s, c)),
+                    _ => self.read_list(s, c, depth + 1)?,
+                }
             }
             0x0C => {
                 // ObjectSpaceManifestListStartFND
@@ -1076,6 +1095,59 @@ mod tests {
         assert!(OneFile::parse(&d).is_err());
     }
 
+    /// A file node list fragment of `cb` bytes holding `nodes`, with no next fragment.
+    fn fragment(nodes: &[u8], cb: usize) -> Vec<u8> {
+        let mut f = 0xA456_7AB1_F5F7_F4C4u64.to_le_bytes().to_vec();
+        f.extend([0u8; 8]); // list id, fragment sequence
+        f.extend(nodes);
+        f.resize(cb - 20, 0);
+        f.extend(NIL64.to_le_bytes());
+        f.extend(0u32.to_le_bytes());
+        f.extend(0x8BC2_15C3_8233_BA4Bu64.to_le_bytes());
+        f
+    }
+
+    /// A list reference node (8-byte position, 4-byte size).
+    fn ref_node(fid: u32, stp: u64, cb: u32) -> Vec<u8> {
+        let mut n = (fid | (16 << 10) | (2 << 27)).to_le_bytes().to_vec();
+        n.extend(stp.to_le_bytes());
+        n.extend(cb.to_le_bytes());
+        n
+    }
+
+    /// A file whose one object space manifest list holds the given revision manifest list
+    /// references (fid 0x10). Lists: root at 200, object space at 300, empty list at 400.
+    fn file_with_rev_refs(refs: &[(u64, u32)]) -> Vec<u8> {
+        const LEN: usize = 100;
+        let mut d = header();
+        d.resize(172, 0);
+        d.extend(200u64.to_le_bytes());
+        d.extend((LEN as u32).to_le_bytes());
+        d.resize(200, 0);
+        d.extend(fragment(&ref_node(0x08, 300, LEN as u32), LEN));
+        let mut space = (0x0Cu32 | (24 << 10)).to_le_bytes().to_vec(); // ObjectSpaceManifestListStart
+        space.extend([7u8; 16]);
+        space.extend(1u32.to_le_bytes());
+        for &(stp, cb) in refs {
+            space.extend(ref_node(0x10, stp, cb));
+        }
+        d.extend(fragment(&space, LEN));
+        d.extend(fragment(&[], LEN));
+        d
+    }
+
+    #[test]
+    fn only_the_last_revision_manifest_list_reference_is_followed() {
+        // zero reference before the real one (written by OneNote)
+        assert!(OneFile::parse(&file_with_rev_refs(&[(0, 0), (400, 100)])).is_ok());
+        // stale reference to garbage before the real one
+        assert!(OneFile::parse(&file_with_rev_refs(&[(100_000, 64), (400, 100)])).is_ok());
+        // the last reference is the one that is read
+        assert!(OneFile::parse(&file_with_rev_refs(&[(400, 100), (100_000, 64)])).is_err());
+        // a lone zero reference means no revisions
+        assert!(OneFile::parse(&file_with_rev_refs(&[(0, 0)])).is_ok());
+    }
+
     #[test]
     fn global_id_entry3_is_bounded_by_the_table() {
         // a = 5, b = 50; `n` = 4, or 4 billion (which would otherwise mean 4 billion lookups)
@@ -1096,6 +1168,7 @@ mod tests {
                 dep_table: HashMap::from([(5u32, [1u8; 16]), (7, [2; 16]), (100, [3; 16])]),
                 active: HashSet::new(),
                 nodes: 0,
+                rev_list_ref: None,
             };
             let t = std::time::Instant::now();
             p.node(0x26, 0, 0, 0, 0).unwrap();
