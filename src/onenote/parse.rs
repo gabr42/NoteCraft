@@ -469,6 +469,12 @@ pub struct OneFile {
 }
 
 const NIL64: u64 = u64::MAX;
+/// FileNodeListHeader.uintMagic (MS-ONESTORE 2.4.2).
+const FRAGMENT_HEADER_MAGIC: u64 = 0xA456_7AB1_F5F7_F4C4;
+/// FileNodeListFragment.footer (MS-ONESTORE 2.4.1).
+const FRAGMENT_FOOTER_MAGIC: u64 = 0x8BC2_15C3_8233_BA4B;
+/// Smallest file node list fragment: header (16) + nextFragment (12) + footer (8).
+const MIN_FRAGMENT: u64 = 36;
 /// Deepest nesting of file node lists followed.
 const MAX_LIST_DEPTH: u32 = 64;
 /// Most file nodes read from one file; stops lists that reference each other in a fan-out.
@@ -614,9 +620,20 @@ impl Parser<'_> {
                 return Err(format!("file node lists form a loop at offset {stp}"));
             }
             chain.push((stp, cb));
+            if cb < MIN_FRAGMENT {
+                return Err(format!("file node list at offset {stp} is too short ({cb} bytes)"));
+            }
             let end = stp.checked_add(cb).ok_or("file node list runs past the end of the file")?;
-            let mut pos = stp.checked_add(16).ok_or("file node list runs past the end of the file")?;
-            while pos.saturating_add(4) <= end.saturating_sub(20) {
+            if self.r.u64_at(us(stp)?)? != FRAGMENT_HEADER_MAGIC {
+                return Err(format!("no file node list at offset {stp}"));
+            }
+            if self.r.u64_at(us(end - 8)?)? != FRAGMENT_FOOTER_MAGIC {
+                return Err(format!("file node list at offset {stp} has no valid end marker"));
+            }
+            // nodes run from after the header (16 bytes) up to nextFragment (the last 20 bytes)
+            let tail = end - 20;
+            let mut pos = stp + 16;
+            while pos.saturating_add(4) <= tail {
                 let hdr = self.r.u32_at(us(pos)?)?;
                 let fid = hdr & 0x3FF;
                 let size = ((hdr >> 10) & 0x1FFF) as u64;
@@ -630,7 +647,7 @@ impl Parser<'_> {
                 self.node(fid, us(pos.saturating_add(4))?, (hdr >> 23) & 3, (hdr >> 25) & 3, depth)?;
                 pos = pos.saturating_add(size);
             }
-            let tail = us(end.checked_sub(20).ok_or("file node list is too short")?)?;
+            let tail = us(tail)?;
             let nstp = self.r.u64_at(tail)?;
             let ncb = self.r.u32_at(tail + 8)? as u64;
             if nstp == NIL64 {
@@ -1084,27 +1101,69 @@ mod tests {
     #[test]
     fn node_list_cycle_is_an_error() {
         // header, then a list at 184 whose "next" pointer points to itself
+        let mut d = file_with_root(184, 100);
+        d.extend(fragment_to(&[], 100, 184, 100));
+        let err = OneFile::parse(&d).err().unwrap();
+        assert!(err.contains("loop"), "{err}");
+    }
+
+    /// File header with the root file node list reference, padded to offset `stp`.
+    fn file_with_root(stp: u64, cb: u32) -> Vec<u8> {
         let mut d = header();
         d.resize(172, 0);
-        d.extend(184u64.to_le_bytes());
-        d.extend(100u32.to_le_bytes()); // list 184..284
-        d.resize(184, 0);
-        d.resize(284, 0);
-        d[264..272].copy_from_slice(&184u64.to_le_bytes());
-        d[272..276].copy_from_slice(&100u32.to_le_bytes());
-        assert!(OneFile::parse(&d).is_err());
+        d.extend(stp.to_le_bytes());
+        d.extend(cb.to_le_bytes());
+        d.resize(stp as usize, 0);
+        d
     }
 
     /// A file node list fragment of `cb` bytes holding `nodes`, with no next fragment.
     fn fragment(nodes: &[u8], cb: usize) -> Vec<u8> {
-        let mut f = 0xA456_7AB1_F5F7_F4C4u64.to_le_bytes().to_vec();
+        fragment_to(nodes, cb, NIL64, 0)
+    }
+
+    /// A file node list fragment of `cb` bytes holding `nodes`, followed by the fragment at `next`.
+    fn fragment_to(nodes: &[u8], cb: usize, next: u64, next_cb: u32) -> Vec<u8> {
+        let mut f = FRAGMENT_HEADER_MAGIC.to_le_bytes().to_vec();
         f.extend([0u8; 8]); // list id, fragment sequence
         f.extend(nodes);
         f.resize(cb - 20, 0);
-        f.extend(NIL64.to_le_bytes());
-        f.extend(0u32.to_le_bytes());
-        f.extend(0x8BC2_15C3_8233_BA4Bu64.to_le_bytes());
+        f.extend(next.to_le_bytes());
+        f.extend(next_cb.to_le_bytes());
+        f.extend(FRAGMENT_FOOTER_MAGIC.to_le_bytes());
         f
+    }
+
+    #[test]
+    fn fragment_markers_and_size_are_checked() {
+        // a valid empty root list parses
+        let mut ok = file_with_root(184, 36);
+        ok.extend(fragment(&[], 36));
+        assert!(OneFile::parse(&ok).is_ok());
+        // sizes below 36 bytes, including those where the footer would overlap the header
+        for cb in [0u32, 19, 20, 35] {
+            let mut d = file_with_root(184, cb);
+            d.extend(fragment(&[], 36));
+            let err = OneFile::parse(&d).err().unwrap();
+            assert!(err.contains("too short"), "cb {cb}: {err}");
+        }
+        // wrong header marker
+        let mut d = ok.clone();
+        d[184] ^= 1;
+        let err = OneFile::parse(&d).err().unwrap();
+        assert!(err.contains("no file node list"), "{err}");
+        // wrong footer marker
+        let mut d = ok.clone();
+        let last = d.len() - 1;
+        d[last] ^= 1;
+        let err = OneFile::parse(&d).err().unwrap();
+        assert!(err.contains("end marker"), "{err}");
+        // a next fragment pointing at bytes that are not a fragment
+        let mut d = file_with_root(184, 36);
+        d.extend(fragment_to(&[], 36, 220, 36));
+        d.extend([0u8; 36]);
+        let err = OneFile::parse(&d).err().unwrap();
+        assert!(err.contains("no file node list at offset 220"), "{err}");
     }
 
     /// A list reference node (8-byte position, 4-byte size).
@@ -1119,11 +1178,7 @@ mod tests {
     /// references (fid 0x10). Lists: root at 200, object space at 300, empty list at 400.
     fn file_with_rev_refs(refs: &[(u64, u32)]) -> Vec<u8> {
         const LEN: usize = 100;
-        let mut d = header();
-        d.resize(172, 0);
-        d.extend(200u64.to_le_bytes());
-        d.extend((LEN as u32).to_le_bytes());
-        d.resize(200, 0);
+        let mut d = file_with_root(200, LEN as u32);
         d.extend(fragment(&ref_node(0x08, 300, LEN as u32), LEN));
         let mut space = (0x0Cu32 | (24 << 10)).to_le_bytes().to_vec(); // ObjectSpaceManifestListStart
         space.extend([7u8; 16]);
