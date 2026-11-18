@@ -1103,7 +1103,7 @@ mod tests {
         assert!(tree.children.is_empty());
         assert_eq!(tree.page_count, 1);
         assert_eq!(list_pages(&root, SortOrder::Name).len(), 1);
-        let idx = Index::build(&[root.clone()]);
+        let idx = Index::build(std::slice::from_ref(&root));
         assert_eq!(idx.pages.len(), 1);
         assert!(idx.search("zebrafish", 10).is_empty());
         let _ = fs::remove_dir_all(&root);

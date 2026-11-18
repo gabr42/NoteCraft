@@ -981,7 +981,7 @@ mod tests {
         titled(&old, "2026-11-01T100000.md", "Live", "\nthe zebra was here\n");
         let d = titled(&top, "Gone.md", "Gone", "\nanother zebra\n");
         delete_page(&d, at(9, 0)).unwrap();
-        let hits = collect(&[top.clone()], "ZEBRA", false);
+        let hits = collect(std::slice::from_ref(&top), "ZEBRA", false);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].title, "Gone");
         assert!(matches!(hits[0].kind, HitKind::Deleted { .. }));
@@ -990,7 +990,7 @@ mod tests {
         assert_eq!(hits[1].when, NaiveDate::from_ymd_opt(2026, 11, 1).unwrap().and_hms_opt(10, 0, 0).unwrap());
         assert!(hits[1].snippet.contains("zebra"));
         assert_eq!(hits[1].place, top.file_name().unwrap().to_string_lossy());
-        assert!(collect(&[top.clone()], "unicorn", false).is_empty());
+        assert!(collect(std::slice::from_ref(&top), "unicorn", false).is_empty());
         let _ = fs::remove_dir_all(&top);
     }
 
@@ -1004,7 +1004,7 @@ mod tests {
             titled(&vd, &format!("{t}.md"), "P", "\nmoose\n");
         }
         titled(&vd, "2026-11-04T100000.md", "P", "\nelk\n");
-        let hits = collect(&[top.clone()], "moose", false);
+        let hits = collect(std::slice::from_ref(&top), "moose", false);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].older_matches, 2);
         assert!(hits[0].file.to_string_lossy().contains("2026-11-03T100000"));
@@ -1019,7 +1019,7 @@ mod tests {
         let p = titled(&s, "Inner.md", "Inner", "\nwalrus\n");
         snapshot_now(&p, at(8, 0)).unwrap();
         delete_folder(&s, at(9, 0)).unwrap();
-        let hits = collect(&[top.clone()], "walrus", false);
+        let hits = collect(std::slice::from_ref(&top), "walrus", false);
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].title, "Inner");
         assert!(matches!(hits[0].kind, HitKind::Deleted { .. }));
@@ -1035,7 +1035,7 @@ mod tests {
         let vd = versions_dir(&p);
         fs::create_dir_all(&vd).unwrap();
         titled(&vd, "2026-11-01T100000.md", "P", "\nmoose\n");
-        assert!(collect(&[top.clone()], "moose", true).is_empty());
+        assert!(collect(std::slice::from_ref(&top), "moose", true).is_empty());
         let _ = fs::remove_dir_all(&top);
     }
 
@@ -1049,7 +1049,7 @@ mod tests {
         let b = titled(&vd, "2026-11-02T100000.md", "P", "\nmoose\n");
         let flag = std::sync::atomic::AtomicBool::new(false);
         let n = std::sync::atomic::AtomicUsize::new(0);
-        search_history(&[top.clone()], "moose", &flag, &|_| {
+        search_history(std::slice::from_ref(&top), "moose", &flag, &|_| {
             n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = fs::remove_file(&a);
             let _ = fs::remove_file(&b);
