@@ -204,7 +204,7 @@ pub fn fcr(r: &Rd, pos: usize, stp_f: u32, cb_f: u32) -> Result<(u64, u64, usize
 
 /// Decodes UTF-16LE text (lossily) and trims trailing NULs.
 pub fn u16s(b: &[u8]) -> String {
-    let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
     String::from_utf16_lossy(&units).trim_end_matches('\0').to_string()
 }
 
@@ -239,15 +239,17 @@ const MAX_EMPTY_ARRAY: usize = 65_536;
 /// bounded by the data, but nested arrays multiply; this keeps a crafted set from exhausting memory.
 const MAX_PROPSET_VALUES: usize = 1 << 20;
 
+/// One id stream of a property set: (ids, position after it, extended flag, no-osid flag).
+type IdStream = (Vec<Option<ObjId>>, usize, bool, bool);
+
 /// Reads the property set at `pos`: the object, object space and context id streams,
 /// then the properties. `cid` turns a raw compact id into an object id.
 pub fn read_propset(r: &Rd, pos: usize, cid: &dyn Fn(u32) -> Option<ObjId>) -> Result<PropSet, String> {
-    // One id stream: (ids, position after it, extended flag, no-osid flag).
-    let stream = |pos: usize| -> Result<(Vec<Option<ObjId>>, usize, bool, bool), String> {
+    let stream = |pos: usize| -> Result<IdStream, String> {
         let v = r.u32_at(pos)?;
         let cnt = (v & 0xFF_FFFF) as usize;
         let raw = r.bytes(pos + 4, cnt * 4)?;
-        let ids = raw.chunks_exact(4).map(|c| cid(u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect();
+        let ids = raw.as_chunks::<4>().0.iter().map(|&c| cid(u32::from_le_bytes(c))).collect();
         Ok((ids, pos + 4 + cnt * 4, v & (1 << 30) != 0, v & (1 << 31) != 0))
     };
     let (oids, mut pos, ext, no_osid) = stream(pos)?;
@@ -311,7 +313,7 @@ impl PropState<'_, '_> {
         let n = self.r.u16_at(pos)? as usize;
         let mut pos = pos + 2;
         let raw = self.r.bytes(pos, n * 4)?;
-        let prids: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let prids: Vec<u32> = raw.as_chunks::<4>().0.iter().map(|&c| u32::from_le_bytes(c)).collect();
         pos += n * 4;
         let mut props = HashMap::new();
         for prid in prids {
@@ -780,7 +782,7 @@ impl Parser<'_> {
                     let start = p + 4;
                     let end = start.saturating_add(cch.saturating_mul(2)).min(r.d.len());
                     let b = r.d.get(start..end).unwrap_or(&[]);
-                    let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                    let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
                     Ok((String::from_utf16_lossy(&units), start.saturating_add(cch.saturating_mul(2))))
                 };
                 let (rf, p) = text(p)?;

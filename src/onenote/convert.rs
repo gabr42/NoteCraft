@@ -169,7 +169,7 @@ static TITLE_ESC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\([\\*_`\[
 /// Decodes UTF-16LE like Python's `decode('utf-16le', 'replace')`: lone surrogates and a stray last
 /// byte become U+FFFD.
 fn decode_utf16le(b: &[u8]) -> String {
-    let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
     let mut s = String::from_utf16_lossy(&units);
     if b.len() % 2 == 1 {
         s.push('\u{FFFD}');
@@ -299,7 +299,7 @@ impl<'a> Converter<'a> {
         let idxs: Vec<usize> = rt
             .props
             .get_bytes(P_RUN_INDEX)
-            .map(|b| b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect())
+            .map(|b| b.as_chunks::<4>().0.iter().map(|&c| u32::from_le_bytes(c) as usize).collect())
             .unwrap_or_default();
         let fmts = rt.props.get_ids(P_RUN_FMT);
         let mut bounds = vec![0usize];
@@ -337,24 +337,21 @@ impl<'a> Converter<'a> {
             }
             let mut t = t;
             let mut link: Option<String> = None;
-            if t.contains('\u{FDDF}') {
-                if let Some(c) = HYPERLINK_RE.captures(&t) {
-                    let l = c[1].to_string();
-                    let m = c.get(0).unwrap();
-                    t = format!("{}{}", &t[..m.start()], &t[m.end()..]).replace('\u{FDDF}', "");
-                    if t.is_empty() {
-                        t = l.clone();
-                    }
-                    link = Some(l).filter(|l| !l.is_empty());
+            if t.contains('\u{FDDF}')
+                && let Some(c) = HYPERLINK_RE.captures(&t)
+            {
+                let l = c[1].to_string();
+                let m = c.get(0).unwrap();
+                t = format!("{}{}", &t[..m.start()], &t[m.end()..]).replace('\u{FDDF}', "");
+                if t.is_empty() {
+                    t = l.clone();
                 }
+                link = Some(l).filter(|l| !l.is_empty());
             }
             t = t
                 .replace("\r\n", "\n")
-                .replace('\r', "\n")
-                .replace('\u{0B}', "\n")
-                .replace('\u{2028}', "\n")
-                .replace('\0', "")
-                .replace('\u{FDDF}', "");
+                .replace(['\r', '\u{0B}', '\u{2028}'], "\n")
+                .replace(['\0', '\u{FDDF}'], "");
             let font = f.get_bytes(P_FONT).filter(|b| !b.is_empty()).map(|b| u16s(b).to_lowercase());
             let code = font.is_some_and(|f| MONO.contains(&f.as_str()));
             let ws = [' ', '\t'];

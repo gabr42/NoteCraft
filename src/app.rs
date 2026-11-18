@@ -317,10 +317,10 @@ impl NoteApp {
         }
         if let Some(q) = start_search {
             app.search = q;
-            if let Some(rx) = app.index_rx.take() {
-                if let Ok(idx) = rx.recv() {
-                    app.index = idx;
-                }
+            if let Some(rx) = app.index_rx.take()
+                && let Ok(idx) = rx.recv()
+            {
+                app.index = idx;
             }
         }
         if start_edit && app.page.is_some() {
@@ -460,10 +460,10 @@ impl NoteApp {
 
     /// Reads the open page again from disk (it is closed when its file is gone).
     fn reload_open_page(&mut self) {
-        if let Some(p) = self.page.take() {
-            if p.path.is_file() {
-                self.open_page(&p.path);
-            }
+        if let Some(p) = self.page.take()
+            && p.path.is_file()
+        {
+            self.open_page(&p.path);
         }
     }
 
