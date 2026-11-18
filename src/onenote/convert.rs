@@ -350,11 +350,8 @@ impl<'a> Converter<'a> {
             }
             t = t
                 .replace("\r\n", "\n")
-                .replace('\r', "\n")
-                .replace('\u{0B}', "\n")
-                .replace('\u{2028}', "\n")
-                .replace('\0', "")
-                .replace('\u{FDDF}', "");
+                .replace(['\r', '\u{0B}', '\u{2028}'], "\n")
+                .replace(['\0', '\u{FDDF}'], "");
             let font = f.get_bytes(P_FONT).filter(|b| !b.is_empty()).map(|b| u16s(b).to_lowercase());
             let code = font.is_some_and(|f| MONO.contains(&f.as_str()));
             let ws = [' ', '\t'];
