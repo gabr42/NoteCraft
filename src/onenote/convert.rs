@@ -169,7 +169,7 @@ static TITLE_ESC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\([\\*_`\[
 /// Decodes UTF-16LE like Python's `decode('utf-16le', 'replace')`: lone surrogates and a stray last
 /// byte become U+FFFD.
 fn decode_utf16le(b: &[u8]) -> String {
-    let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
     let mut s = String::from_utf16_lossy(&units);
     if b.len() % 2 == 1 {
         s.push('\u{FFFD}');
@@ -299,7 +299,7 @@ impl<'a> Converter<'a> {
         let idxs: Vec<usize> = rt
             .props
             .get_bytes(P_RUN_INDEX)
-            .map(|b| b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect())
+            .map(|b| b.as_chunks::<4>().0.iter().map(|&c| u32::from_le_bytes(c) as usize).collect())
             .unwrap_or_default();
         let fmts = rt.props.get_ids(P_RUN_FMT);
         let mut bounds = vec![0usize];
